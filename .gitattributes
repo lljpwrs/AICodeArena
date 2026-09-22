@@ -1,0 +1,111 @@
+###############################################################################
+# Normalize line endings
+###############################################################################
+
+# 所有文本文件统一存储为 LF
+* text=auto eol=lf
+
+###############################################################################
+# Source Code
+###############################################################################
+
+*.py      text eol=lf
+*.pyi     text eol=lf
+*.sh      text eol=lf
+*.bash    text eol=lf
+*.zsh     text eol=lf
+
+*.js      text eol=lf
+*.ts      text eol=lf
+*.jsx     text eol=lf
+*.tsx     text eol=lf
+
+*.css     text eol=lf
+*.scss    text eol=lf
+*.html    text eol=lf
+
+###############################################################################
+# Configuration
+###############################################################################
+
+*.toml    text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.json    text eol=lf
+*.xml     text eol=lf
+*.ini     text eol=lf
+*.cfg     text eol=lf
+*.conf    text eol=lf
+
+Dockerfile text eol=lf
+*.dockerfile text eol=lf
+
+###############################################################################
+# Documentation
+###############################################################################
+
+*.md      text eol=lf
+*.txt     text eol=lf
+*.rst     text eol=lf
+
+###############################################################################
+# Notebook
+###############################################################################
+
+*.ipynb   text eol=lf
+
+###############################################################################
+# Windows Scripts
+###############################################################################
+
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+*.ps1     text eol=crlf
+
+###############################################################################
+# Binary Files
+###############################################################################
+
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.bmp     binary
+*.ico     binary
+*.svg     binary
+
+*.pdf     binary
+*.zip     binary
+*.7z      binary
+*.gz      binary
+*.tar     binary
+
+*.exe     binary
+*.dll     binary
+*.so      binary
+*.dylib   binary
+
+*.woff    binary
+*.woff2   binary
+*.ttf     binary
+*.otf     binary
+
+###############################################################################
+# AI Models
+###############################################################################
+
+*.pt          binary
+*.pth         binary
+*.ckpt        binary
+*.onnx        binary
+*.bin         binary
+*.gguf        binary
+*.ggml        binary
+*.safetensors binary
+
+###############################################################################
+# Vector Database
+###############################################################################
+
+*.faiss   binary
+*.index   binary

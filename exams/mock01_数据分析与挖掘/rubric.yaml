@@ -1,0 +1,113 @@
+# mock01 评分表（机器可读）
+#
+# 由 scripts/grade_notebook.py 消费。检查器语义见该脚本的顶层 docstring。
+# 正则一律用单引号包裹，反斜杠原样书写。
+#
+# 该表与 README.md 的「四、评分表」逐项一一对应，改一处必须同步另一处。
+
+meta:
+  title: mock01 数据分析与挖掘
+  limit_min: 90
+  total: 50
+
+steps:
+  - name: 第一步 数据探索与预处理
+    items:
+      - id: E1
+        desc: 结构探查（shape + info + dtypes）
+        score: 2
+        static_all: ['\.shape', '\.info\(']
+
+      - id: E2
+        desc: 描述统计与类别分布
+        score: 2
+        static_any: ['\.describe\(', 'value_counts']
+
+      - id: E3
+        desc: 缺失与重复统计
+        score: 2
+        static_all: ['isna\(\)|isnull\(\)', 'duplicated\(\)']
+
+      - id: C1
+        desc: 重复值删除（并打印行数）
+        score: 2
+        static_any: ['drop_duplicates']
+        output_regex: '删除|重复'
+
+      - id: C2
+        desc: 日期多格式解析
+        score: 2
+        static_any: ['to_datetime', 'strptime']
+
+      - id: C3
+        desc: 负荷值与类别清洗
+        score: 2
+        static_all: ['to_numeric|astype\(float\)', 'map\(|replace\(']
+
+      - id: C4
+        desc: 缺失值填充（并打印条数）
+        score: 2
+        static_any: ['fillna', 'interpolate']
+        output_regex: '填充'
+
+      - id: C5
+        desc: 箱线图 + IQR 处理异常
+        score: 2
+        static_all: ['boxplot', 'quantile', 'clip|drop']
+        output_regex: '异常'
+
+      - id: V1
+        desc: 可视化 1 等级分布柱状图
+        score: 2
+        static_any: ['kind\s*=\s*.bar.', '\.bar\(', 'countplot']
+
+      - id: V2
+        desc: 可视化 2 处理时长直方图
+        score: 2
+        static_any: ['hist\(|histplot']
+
+  - name: 第二步 数据挖掘
+    items:
+      - id: M1
+        desc: 划分训练与测试集
+        score: 4
+        static_any: ['train_test_split']
+
+      - id: M2
+        desc: 特征工程（编码 + 标准化）
+        score: 4
+        static_all: ['OneHotEncoder', 'StandardScaler']
+        order_before: ['train_test_split', '\.fit\(']
+
+      - id: M3
+        desc: 训练逻辑回归
+        score: 4
+        static_any: ['LogisticRegression']
+
+      - id: M4
+        desc: 训练随机森林
+        score: 4
+        static_any: ['RandomForestClassifier']
+
+      - id: M5
+        desc: 输出预测结果与准确率
+        score: 4
+        static_any: ['\.predict\(']
+        value_expr: 'acc_rf >= 0.80'
+
+  - name: 第三步 评估与调优
+    items:
+      - id: T1
+        desc: 四项分类评估指标
+        score: 3
+        static_all: ['accuracy_score', 'precision_score', 'recall_score', 'f1_score']
+
+      - id: T2
+        desc: 混淆矩阵热力图
+        score: 4
+        static_all: ['confusion_matrix', 'imshow']
+
+      - id: T3
+        desc: 网格调参并报告最佳参数
+        score: 3
+        static_all: ['GridSearchCV', 'best_params_']

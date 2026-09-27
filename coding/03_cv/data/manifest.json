@@ -1,0 +1,157 @@
+{
+  "classic/board.jpg": {
+    "md5": "98025fadfb2e3685bf6ac5ea628d5fb9",
+    "bytes": 121597,
+    "source": "https://github.com/opencv/opencv (samples/data, Apache-2.0)"
+  },
+  "classic/box.png": {
+    "md5": "1b2263183819cd2553f73ed9e890f9cd",
+    "bytes": 50728,
+    "source": "https://github.com/opencv/opencv (samples/data, Apache-2.0)"
+  },
+  "classic/building.jpg": {
+    "md5": "0b4ff3491cdcb526e0c652047483dd08",
+    "bytes": 79718,
+    "source": "https://github.com/opencv/opencv (samples/data, Apache-2.0)"
+  },
+  "classic/camera.png": {
+    "md5": "f8b13d2cdd5ba56cf4ba2321bb7222f0",
+    "bytes": 139512,
+    "source": "https://github.com/scikit-image/scikit-image (v0.22.0, CC0)"
+  },
+  "classic/cell.png": {
+    "md5": "77bccc0196c8bfd37d9f5418937643dc",
+    "bytes": 74183,
+    "source": "https://github.com/scikit-image/scikit-image (v0.22.0, CC0)"
+  },
+  "classic/coins.png": {
+    "md5": "83d5e6ca6fb2724cdb5cf64cf891f7a8",
+    "bytes": 75825,
+    "source": "https://github.com/scikit-image/scikit-image (v0.22.0, CC0)"
+  },
+  "classic/home.jpg": {
+    "md5": "95ce25ad4b37d6e3f010bf4fd01e1ded",
+    "bytes": 32197,
+    "source": "https://github.com/opencv/opencv (samples/data, Apache-2.0)"
+  },
+  "classic/horse.png": {
+    "md5": "cb37827cfe996bea5492e9fab59097e4",
+    "bytes": 16633,
+    "source": "https://github.com/scikit-image/scikit-image (v0.22.0, CC0)"
+  },
+  "classic/messi5.jpg": {
+    "md5": "dc330e92d7e0058777afcd2535cc0831",
+    "bytes": 72937,
+    "source": "https://github.com/opencv/opencv (samples/data, Apache-2.0)"
+  },
+  "classic/moon.png": {
+    "md5": "932cb5c7a6a594c2c78e55643abf6e71",
+    "bytes": 50177,
+    "source": "https://github.com/scikit-image/scikit-image (v0.22.0, CC0)"
+  },
+  "classic/page.png": {
+    "md5": "4cb551d07b73451acd5ff73868fc7286",
+    "bytes": 47679,
+    "source": "https://github.com/scikit-image/scikit-image (v0.22.0, CC0)"
+  },
+  "classic/smarties.png": {
+    "md5": "76320c7c44547c24f074308d31c6e4ee",
+    "bytes": 90815,
+    "source": "https://github.com/opencv/opencv (samples/data, Apache-2.0)"
+  },
+  "classic/sudoku.png": {
+    "md5": "93dde740f2d4b6a044ab0c06a8ea964d",
+    "bytes": 250720,
+    "source": "https://github.com/opencv/opencv (samples/data, Apache-2.0)"
+  },
+  "classic/text.png": {
+    "md5": "e96b3150d0e79a4c3f3bd815e542b793",
+    "bytes": 42704,
+    "source": "https://github.com/scikit-image/scikit-image (v0.22.0, CC0)"
+  },
+  "helmet/labels.json": {
+    "md5": "b2e58189345ba07a4064274c43dd4a64",
+    "bytes": 5755,
+    "source": "https://github.com/njvisionpower/Safety-Helmet-Wearing-Dataset (image/)"
+  },
+  "helmet/site_01.jpg": {
+    "md5": "eb8012687c61406d95585019640b8e21",
+    "bytes": 154769,
+    "source": "https://github.com/njvisionpower/Safety-Helmet-Wearing-Dataset (image/)"
+  },
+  "helmet/site_01.txt": {
+    "md5": "4eb63cd6ed02664d638f1ccdb2279529",
+    "bytes": 266,
+    "source": "https://github.com/njvisionpower/Safety-Helmet-Wearing-Dataset (image/)"
+  },
+  "helmet/site_02.jpg": {
+    "md5": "0c4bcdb7f13d2e02f5ef42e114dfbb23",
+    "bytes": 215085,
+    "source": "https://github.com/njvisionpower/Safety-Helmet-Wearing-Dataset (image/)"
+  },
+  "helmet/site_03.jpg": {
+    "md5": "bf16d6f892781076a64c56efdab81d76",
+    "bytes": 55512,
+    "source": "https://github.com/njvisionpower/Safety-Helmet-Wearing-Dataset (image/)"
+  },
+  "helmet/site_03.txt": {
+    "md5": "6358f25a3bebd070d0cffb5f99e28b13",
+    "bytes": 228,
+    "source": "https://github.com/njvisionpower/Safety-Helmet-Wearing-Dataset (image/)"
+  },
+  "helmet/site_04.jpg": {
+    "md5": "0d702a51c61bb38aa894836f4fc24a15",
+    "bytes": 147366,
+    "source": "https://github.com/njvisionpower/Safety-Helmet-Wearing-Dataset (image/)"
+  },
+  "helmet/site_05.jpg": {
+    "md5": "220cbdc2846b6b75683780abba062df1",
+    "bytes": 133202,
+    "source": "https://github.com/njvisionpower/Safety-Helmet-Wearing-Dataset (image/)"
+  },
+  "helmet/site_05.txt": {
+    "md5": "49d8068c99197830bcadfeecc62b97d4",
+    "bytes": 380,
+    "source": "https://github.com/njvisionpower/Safety-Helmet-Wearing-Dataset (image/)"
+  },
+  "helmet/site_06.jpg": {
+    "md5": "8a6afadd79e60cb5ebc6e8379c49e86f",
+    "bytes": 172204,
+    "source": "https://github.com/njvisionpower/Safety-Helmet-Wearing-Dataset (image/)"
+  },
+  "helmet/site_07.jpg": {
+    "md5": "dcfde7ca39a6e01c181a30a50425622f",
+    "bytes": 50290,
+    "source": "https://github.com/njvisionpower/Safety-Helmet-Wearing-Dataset (image/)"
+  },
+  "helmet/site_07.txt": {
+    "md5": "cc9e3da49a770dc47731b7b9463b3085",
+    "bytes": 228,
+    "source": "https://github.com/njvisionpower/Safety-Helmet-Wearing-Dataset (image/)"
+  },
+  "helmet/site_08.jpg": {
+    "md5": "ce7d60993464227e405ff27cb244a1f5",
+    "bytes": 308996,
+    "source": "https://github.com/njvisionpower/Safety-Helmet-Wearing-Dataset (image/)"
+  },
+  "helmet/site_09.jpg": {
+    "md5": "f1838831f9ba6a2841dfdc63647b27bf",
+    "bytes": 163939,
+    "source": "https://github.com/njvisionpower/Safety-Helmet-Wearing-Dataset (image/)"
+  },
+  "helmet/site_10.jpg": {
+    "md5": "b58257aacb7025a12eef0109d10b1945",
+    "bytes": 469445,
+    "source": "https://github.com/njvisionpower/Safety-Helmet-Wearing-Dataset (image/)"
+  },
+  "mnist/mnist_test_sub.npz": {
+    "md5": "a842e0b34df9c766d496d43ca1619d2a",
+    "bytes": 84230,
+    "source": "MNIST via torchvision (ossci-datasets S3)"
+  },
+  "mnist/mnist_train_sub.npz": {
+    "md5": "2935464f10e3e5f729408aec0a8b8f5c",
+    "bytes": 331430,
+    "source": "MNIST via torchvision (ossci-datasets S3)"
+  }
+}

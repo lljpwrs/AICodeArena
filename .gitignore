@@ -160,15 +160,13 @@ weights/
 
 # ============================================================
 # Dataset
+# 只忽略仓库根目录下的大数据集；coding/<方向>/data/ 里的合成数据要提交
+# 约定：单个 CSV < 1 MB 直接提交，超过则只提交 make_data.py
 # ============================================================
 
-data/
-dataset/
-datasets/
-
-# Exceptions (保留示例数据)
-!data/README.md
-!data/.gitkeep
+/data/
+/dataset/
+/datasets/
 
 # ============================================================
 # Vector Database
@@ -230,6 +228,9 @@ settings.local.*
 
 coverage.xml
 coverage.json
+
+# 03_cv MNIST 原始缓存（65MB，npz 子集已提交，可由 make_data.py 重新生成）
+coding/03_cv/data/_raw/
 
 # Profiling
 .prof

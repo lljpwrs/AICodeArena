@@ -1,0 +1,1017 @@
+#!/usr/bin/env python3
+"""cv07 图像特征与分类：颜色直方图 / compareHist / 均衡化与 CLAHE / 手撕 LBP /
+LBP uniform 降维 / 手撕 HOG / 三种特征接 sklearn / 混淆矩阵。
+
+数据：classic/home.jpg、camera.png + mnist 子集（2000 训练 / 500 测试）。
+真值全部实跑（opencv 5.0.0 / scikit-learn 1.9.1）。
+
+> 本仓环境里 **没有 skimage，也没有 `cv2.HOGDescriptor`**（OpenCV 5 主模块已移除），
+> 所以 LBP / HOG 都是手撕实现 —— 对竞赛来说这反而是好事：特征算子要能自己写出来。
+> HOG 另给一个「朴素三重循环版」当对账基准（和 ch04 的 `correlate_zero_pad` 一个思路）。
+
+生成命令：
+    /Users/luolinjie/miniconda3/envs/self/bin/python scripts/authoring/cv07_features_classify.py
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from nb_builder import build, code, md, report  # noqa: E402
+
+OUT = Path(__file__).resolve().parents[2] / "coding" / "03_cv"
+NAME = "ch07_features_classify"
+
+IMPORTS = '''from pathlib import Path
+
+import warnings
+
+import numpy as np
+
+warnings.simplefilter("ignore")
+
+import cv2
+from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import LinearSVC
+
+DATA = Path("data")
+CL = DATA / "classic"
+HE = DATA / "helmet"
+MN = DATA / "mnist"
+'''
+
+SETUP = '''home = cv2.imread(str(CL / "home.jpg"))
+cam = cv2.imread(str(CL / "camera.png"))
+
+mn_tr = np.load(str(MN / "mnist_train_sub.npz"))
+mn_te = np.load(str(MN / "mnist_test_sub.npz"))
+Xtr_img, ytr = mn_tr["images"], mn_tr["labels"]
+Xte_img, yte = mn_te["images"], mn_te["labels"]
+dig0 = Xtr_img[0]
+
+print("home", home.shape, "| camera", cam.shape)
+print("MNIST 训练", Xtr_img.shape, "标签分布", np.bincount(ytr).tolist())
+print("MNIST 测试", Xte_img.shape, "标签分布", np.bincount(yte).tolist())
+print("dig0", dig0.shape, dig0.dtype, "灰度范围", int(dig0.min()), "~", int(dig0.max()))
+'''
+
+SCAFFOLD = '''# 脚手架：写在 @@todo 之外，练习版原样保留
+CELL, BINS, BLOCK = 7, 9, 2
+OFFSETS = [(-1, -1), (-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1)]
+
+
+def hgt(im, bins=256):
+    """单通道直方图（省得每次写 cv2.calcHist 的一长串参数）。"""
+    return cv2.calcHist([im], [0], None, [bins], [0, 256])
+
+
+def unit(v):
+    """把向量归一化成单位长度（加 1e-6 防止除零）。"""
+    return v / np.sqrt((v ** 2).sum() + 1e-6)
+
+
+def max_abs_diff(a, b):
+    """向量/矩阵的逐元素最大绝对差。"""
+    return round(float(np.abs(np.asarray(a, np.float64) - np.asarray(b, np.float64)).max()), 8)
+
+
+def hog_naive(img, cell=CELL, bins=BINS, block=BLOCK):
+    """朴素三重循环版 HOG（边界用最近邻复制）。慢，但每一步都看得见 —— 用来给向量化版对账。"""
+    g = img.astype(np.float64)
+    h, w = g.shape
+    gx = np.zeros_like(g)
+    gy = np.zeros_like(g)
+    for i in range(h):
+        for j in range(w):
+            i0, i1 = max(i - 1, 0), min(i + 1, h - 1)
+            j0, j1 = max(j - 1, 0), min(j + 1, w - 1)
+            gx[i, j] = g[i, j1] - g[i, j0]
+            gy[i, j] = g[i1, j] - g[i0, j]
+    mag = np.hypot(gx, gy)
+    ang = np.degrees(np.arctan2(gy, gx)) % 180.0
+    bidx = np.minimum((ang * bins / 180.0).astype(np.int32), bins - 1)
+    ny, nx = h // cell, w // cell
+    cells = np.zeros((ny, nx, bins), np.float64)
+    mm = mag[:ny * cell, :nx * cell]
+    bb = bidx[:ny * cell, :nx * cell]
+    for k in range(bins):
+        cells[:, :, k] = (mm * (bb == k)).reshape(ny, cell, nx, cell).sum(axis=(1, 3))
+    out = []
+    for by in range(ny - block + 1):
+        for bx in range(nx - block + 1):
+            out.append(unit(cells[by:by + block, bx:bx + block, :].ravel()))
+    return np.concatenate(out)
+
+
+print("脚手架就绪：CELL/BINS/BLOCK / OFFSETS / hgt / unit / max_abs_diff / hog_naive")'''
+
+# =========================================================================== #
+# 练习（答案版内容，practice 由 builder 自动挖空）
+# =========================================================================== #
+
+E1_CODE = '''gh = cv2.cvtColor(home, cv2.COLOR_BGR2GRAY)
+hsv = cv2.cvtColor(home, cv2.COLOR_BGR2HSV)
+# @@todo(1) 颜色直方图：灰度 / BGR 三通道 / H-S 二维 / 两种归一化 / mask / 累积和中位数
+# @@hint cv2.calcHist([img], [ch], mask, [bins], [lo, hi])；mask 必须与图像同尺寸
+# @@hint 二维直方图把通道写成 [0, 1]、区间写成 [0, 180, 0, 256]；中位数用累积和 + np.searchsorted
+hist_g = cv2.calcHist([gh], [0], None, [256], [0, 256])
+hist_bgr = [cv2.calcHist([home], [c], None, [256], [0, 256]) for c in range(3)]
+hist_hs = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+mk = np.zeros_like(gh)
+mk[:, :gh.shape[1] // 2] = 255
+hist_masked = cv2.calcHist([gh], [0], mk, [256], [0, 256])
+hn = cv2.normalize(hist_g, None, 0, 1, cv2.NORM_MINMAX)
+hl1 = cv2.normalize(hist_g, None, 1.0, 0, cv2.NORM_L1)
+h_sum = round(float(hist_g.sum()), 1)
+h_peak = (int(hist_g.argmax()), int(hist_g.max()))
+h_empty = int((hist_g == 0).sum())
+h_ch_mean = tuple(round(float(h.mean()), 1) for h in hist_bgr)
+h_hs_peak = tuple(int(v) for v in np.unravel_index(hist_hs.argmax(), hist_hs.shape))
+h_hs_count = round(float(hist_hs.max()), 1)
+h_norm = (round(float(hn.max()), 4), round(float(hl1.sum()), 6), round(float(hl1.max()), 6))
+h_mask_sum = round(float(hist_masked.sum()), 1)
+h_median = int(np.searchsorted(np.cumsum(hist_g.ravel()), 0.5 * gh.size))
+# @@end
+print("灰度直方图: shape", hist_g.shape, "总和", h_sum, "（= 像素数", gh.size, "）")
+print("峰值 bin:", h_peak, "| 计数为 0 的 bin 数:", h_empty)
+print("BGR 三通道直方图各自的均值:", h_ch_mean)
+print("H-S 二维直方图形状:", hist_hs.shape, "| argmax:", h_hs_peak, "计数", h_hs_count)
+print("NORM_MINMAX 后 max:", h_norm[0], "| NORM_L1 后 sum / max:", h_norm[1], h_norm[2])
+print("mask（只统计左半边）直方图总和:", h_mask_sum, "| 灰度中位数:", h_median)
+print("解读: 直方图的**总和恒等于像素数**（196608），这是自检的第一把尺子。"
+      "归一化有两种常用口径——**NORM_MINMAX 把最大值拉到 1**（形状不变、量纲变了），"
+      "**NORM_L1 把总和拉到 1**（变成概率分布）。做图间比较必须用 NORM_L1，"
+      "否则两幅尺寸不同的图根本不可比。mask 参数可以把统计限制在任意区域（这里左半边正好一半像素）")
+
+assert h_sum == 196608.0 and hist_g.shape == (256,)
+assert h_peak == (111, 3908) and h_empty == 12
+assert h_ch_mean == (768.0, 768.0, 768.0)
+assert h_hs_peak == (17, 30) and h_hs_count == 13482.0
+assert h_norm == (1.0, 1.0, 0.019877)
+assert h_mask_sum == 98304.0 and h_median == 105
+'''
+
+E2_CODE = '''# @@todo(2) 直方图比较：四种方法 × 五种变换（缩小 / 翻转 / 提亮 / 旋转 / 换图）
+# @@hint 方法：HISTCMP_CORREL / CHISQR / INTERSECT / BHATTACHARYYA；CORREL 越接近 1 越像，其余越小越像
+# @@hint 先比"自己 vs 自己"当基准；重点看"水平翻转 / 旋转 90"——它们会暴露直方图丢了什么
+# @@hint 再补两行：把直方图先 NORM_L1 归一化再比，以及降到 16 个 bin 再比
+METHODS = (cv2.HISTCMP_CORREL, cv2.HISTCMP_CHISQR, cv2.HISTCMP_INTERSECT, cv2.HISTCMP_BHATTACHARYYA)
+half = cv2.cvtColor(cv2.resize(home, None, fx=0.5, fy=0.5), cv2.COLOR_BGR2GRAY)
+flip = cv2.flip(gh, 1)
+rot = cv2.rotate(gh, cv2.ROTATE_90_CLOCKWISE)
+bright = cv2.convertScaleAbs(gh, alpha=1.0, beta=25)
+cam_g = cv2.cvtColor(cam, cv2.COLOR_BGR2GRAY)
+cmp_self = tuple(round(cv2.compareHist(hist_g, hist_g, m), 6) for m in METHODS)
+cmp_flip = tuple(round(cv2.compareHist(hist_g, hgt(flip), m), 6) for m in METHODS)
+cmp_rot = tuple(round(cv2.compareHist(hist_g, hgt(rot), m), 6) for m in METHODS)
+cmp_half = tuple(round(cv2.compareHist(hist_g, hgt(half), m), 6) for m in METHODS)
+cmp_bright = tuple(round(cv2.compareHist(hist_g, hgt(bright), m), 6) for m in METHODS)
+cmp_cam = tuple(round(cv2.compareHist(hist_g, hgt(cam_g), m), 6) for m in METHODS)
+n_ref = cv2.normalize(hist_g, None, 1.0, 0, cv2.NORM_L1)
+n_bright = cv2.normalize(hgt(bright), None, 1.0, 0, cv2.NORM_L1)
+cmp_bright_n = tuple(round(cv2.compareHist(n_ref, n_bright, m), 6) for m in METHODS)
+b16_ref = cv2.normalize(hgt(gh, 16), None, 1.0, 0, cv2.NORM_L1)
+b16_bri = cv2.normalize(hgt(bright, 16), None, 1.0, 0, cv2.NORM_L1)
+cmp_bright_16 = tuple(round(cv2.compareHist(b16_ref, b16_bri, m), 6) for m in METHODS)
+# @@end
+print("自己 vs 自己  :", cmp_self)
+print("水平翻转      :", cmp_flip)
+print("旋转 90 度    :", cmp_rot)
+print("缩小 0.5 倍   :", cmp_half)
+print("提亮 +25      :", cmp_bright)
+print("换图 camera   :", cmp_cam)
+print("提亮 +25（先 NORM_L1）:", cmp_bright_n)
+print("提亮 +25（降到 16 bin）:", cmp_bright_16)
+print("解读: 三个结论 —— 1) **水平翻转、旋转 90 度与自身完全相同**（差 0.0）："
+      "直方图是「灰度分布」，**完全不含空间信息**，所以它对平移/旋转/翻转免疫；"
+      "2) `INTERSECT` 与 `CHISQR` 受**直方图尺度**影响（自己 vs 自己 INTERSECT=196608，"
+      "缩小 0.5 倍就只剩 49152），必须先 NORM_L1 归一化再比（提亮 +25 的 CHISQR 从 674103.7 变成 3.43）；"
+      "3) 提亮 +25 后 CORREL 只剩 0.28 —— 全局灰度偏移对直方图特征破坏极大，"
+      "这也解释了为什么前面要学**直方图均衡化**")
+
+assert cmp_self == (1.0, 0.0, 196608.0, 0.0)
+assert cmp_flip == (1.0, 0.0, 196608.0, 0.0)
+assert cmp_rot == (1.0, 0.0, 196608.0, 0.0)
+assert cmp_half == (0.996797, 110738.219957, 49152.0, 0.047981)
+assert cmp_bright == (0.28219, 674103.707624, 112471.0, 0.408864)
+assert cmp_cam == (-0.27512, 2684844.853327, 77870.0, 0.571194)
+assert cmp_bright_n == (0.28219, 3.428669, 0.572057, 0.408864)
+assert cmp_bright_16 == (0.357977, 3.136961, 0.59904, 0.368519)
+'''
+
+E3_CODE = '''low = cv2.normalize(gh, None, 60, 200, cv2.NORM_MINMAX)
+# @@todo(3) 直方图均衡化：equalizeHist / CLAHE 两个 clipLimit / 彩色图只均衡 Y 通道
+# @@hint equalizeHist(low)；CLAHE 用 cv2.createCLAHE(clipLimit=..., tileGridSize=(8, 8)).apply(low)
+# @@hint 彩色图先 cvtColor 到 YCrCb，只对第 0 通道做 equalizeHist，再转回 BGR；对照组是三通道各自均衡
+eq = cv2.equalizeHist(low)
+clahe2 = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(low)
+clahe40 = cv2.createCLAHE(clipLimit=40.0, tileGridSize=(8, 8)).apply(low)
+ycc = cv2.cvtColor(home, cv2.COLOR_BGR2YCrCb)
+ycc[:, :, 0] = cv2.equalizeHist(ycc[:, :, 0])
+eq_y = cv2.cvtColor(ycc, cv2.COLOR_YCrCb2BGR)
+eq_per_ch = np.dstack([cv2.equalizeHist(home[:, :, i]) for i in range(3)])
+std_pair = (round(float(low.std()), 4), round(float(eq.std()), 4))
+empty_pair = (int((hgt(low) == 0).sum()), int((hgt(eq) == 0).sum()))
+eq_stat = (round(float(eq.mean()), 4), len(np.unique(eq)), int(eq.min()), int(eq.max()))
+clahe_std = (round(float(clahe2.std()), 4), round(float(clahe40.std()), 4))
+d_clahe = (int(np.abs(clahe2.astype(int) - eq.astype(int)).max()),
+           int(np.abs(clahe2.astype(int) - clahe40.astype(int)).max()))
+y_vs_ch = (int(np.abs(eq_y.astype(int) - eq_per_ch.astype(int)).max()),
+           round(float(np.abs(eq_y.astype(int) - eq_per_ch.astype(int)).mean()), 4))
+# @@end
+print("压缩到 [60, 200] 后的 std:", std_pair[0], "-> equalizeHist 后:", std_pair[1])
+print("0 计数 bin 数:", empty_pair[0], "->", empty_pair[1], "（变多了！）")
+print("均衡化后: 均值", eq_stat[0], "唯一值数", eq_stat[1], "范围", eq_stat[2], "~", eq_stat[3])
+print("CLAHE clipLimit=2 / 40 的 std:", clahe_std)
+print("CLAHE(clip2) vs equalizeHist 最大差:", d_clahe[0], "| clip2 vs clip40 最大差:", d_clahe[1])
+print("只均衡 Y 通道 vs 三通道各自均衡: 最大差", y_vs_ch[0], "平均差", y_vs_ch[1])
+print("解读: equalizeHist 把 CDF 拉直，std 从 25.33 冲到 73.07 —— 对比度是「暴力」拉满的；"
+      "CLAHE 按 8x8 分块 + 裁剪（clipLimit），明显温和（std 39.17 / 56.83），"
+      "clipLimit 越大越接近全局均衡化（两者最大差 113）。"
+      "**注意「0 计数 bin 从 119 涨到 161」**：均衡化把大量灰阶挤到同一档，"
+      "bin 变空不是 bug，是映射太陡的副作用。"
+      "彩色图必须**只均衡亮度通道**（YCrCb 的 Y 或 Lab 的 L）——"
+      "三通道各自均衡会打乱色彩平衡（与本条实现平均差 24.07、最大差 113）")
+
+assert std_pair == (25.3296, 73.0745)
+assert empty_pair == (119, 161)
+assert eq_stat == (129.617, 95, 0, 255)
+assert clahe_std == (39.1719, 56.8262) and d_clahe == (93, 113) and y_vs_ch == (113, 24.0668)
+'''
+
+E4_CODE = '''def lbp8(img):
+    """8 邻域 LBP：邻域灰度 >= 中心记 1，按 OFFSETS 顺序从低位到高位拼成 uint8。"""
+    # @@todo(4) 手撕 8 邻域 LBP 编码（不许写 for，用列表推导 + 广播）
+    # @@hint 用列表推导取出 8 个「移位后的邻居图」再 np.stack 成一个 (8, H-2, W-2) 的立方体
+    # @@hint 权重 [1,2,4,...,128] 要 reshape 成 (8,1,1) 才能沿第 0 轴广播；比较后用权重加权求和
+    g = img.astype(np.int16)
+    c = g[1:-1, 1:-1]
+    shifts = [g[1 + dy:g.shape[0] - 1 + dy, 1 + dx:g.shape[1] - 1 + dx] for dy, dx in OFFSETS]
+    nb = np.stack(shifts)
+    w = (1 << np.arange(8)).astype(np.uint8).reshape(8, 1, 1)
+    code = ((nb >= c).astype(np.uint8) * w).sum(axis=0).astype(np.uint8)
+    # @@end
+    return code
+
+
+code0 = lbp8(dig0)
+hist0 = np.bincount(code0.ravel(), minlength=256)
+lbp_stat = (code0.shape, str(code0.dtype), int(code0.max()), len(np.unique(code0)), int(hist0.sum()))
+pat = (np.arange(28 * 28).reshape(28, 28) * 7 % 171).astype(np.uint8)
+pat_shift = (pat.astype(np.int16) + 85).astype(np.uint8)
+pat_clip = np.clip(pat.astype(np.int16) + 150, 0, 255).astype(np.uint8)
+lbp_inv = (int(np.abs(lbp8(pat).astype(int) - lbp8(pat_shift).astype(int)).max()),
+           int(np.abs(lbp8(pat).astype(int) - lbp8(pat_clip).astype(int)).max()))
+lbp_geom = (int(np.abs(lbp8(pat).astype(int) - lbp8(np.fliplr(pat)).astype(int)).max()),
+            int(np.abs(lbp8(dig0).astype(int) - np.rot90(lbp8(np.rot90(dig0, 1))).astype(int)).max()))
+lbp_top = [(int(i), int(v)) for i, v in sorted(enumerate(hist0), key=lambda t: -t[1])[:3]]
+print("LBP 输出 (shape, dtype, max, 唯一值数, 直方图总和):", lbp_stat)
+print("灰度平移不变性: 无截断 +85 最大差", lbp_inv[0], "| 有截断 +150 最大差", lbp_inv[1])
+print("几何变换敏感性: 水平镜像最大差", lbp_geom[0], "| 90 度旋转最大差", lbp_geom[1])
+print("dig0 的 LBP 直方图 top3 (编码, 计数):", lbp_top)
+print("解读: LBP 的编码过程只用到**比较**（>=），所以对任意**严格单调**的灰度变换完全不变 ——"
+      "实测把图案整体 +85（值域 85~255，无截断）后 LBP 逐像素差 **0**。"
+      "但一旦**发生截断**（+150 把亮区压到 255），大小关系被破坏，差立刻变成 135。"
+      "另外 LBP 只在「灰度」维度不变：镜像 / 旋转 90 度后编码完全不同（差 255），"
+      "因为它把邻域方向也编码进去了。"
+      "dig0 里 676 个编码有 **554 个是 255**（整片背景全是同一灰度），"
+      "所以原始 LBP 直方图极度不平衡 —— 这就是下一步要降维的原因")
+
+assert lbp_stat == ((26, 26), "uint8", 255, 47, 676)
+assert lbp_inv == (0, 135) and lbp_geom == (255, 255)
+assert lbp_top == [(255, 554), (195, 16), (60, 13)]
+'''
+
+E5_CODE = '''# @@todo(5) LBP 的 uniform 模式：256 个编码里"至多 2 次 0/1 跳变"的有 58 个，其余归到第 59 桶
+# @@hint 向量化：把 0..255 展开成 (256, 8) 的比特矩阵，与 roll(bits, -1, axis=1) 比较后按行求和
+# @@hint 跳变数 <= 2 的位置依次编号 0..57；>2 的全部映射到 58（该值用作 bin 索引）
+vals = np.arange(256, dtype=np.uint8)
+bits = ((vals[:, None] >> np.arange(8)) & 1).astype(np.int8)
+trans = (bits != np.roll(bits, -1, axis=1)).sum(axis=1)
+umap = np.zeros(256, np.int32)
+umap[trans <= 2] = np.arange(int((trans <= 2).sum()))
+umap[trans > 2] = int((trans <= 2).sum())
+u_info = (int((trans <= 2).sum()), int(umap.max()) + 1, umap[:8].tolist())
+u_spot = (int(umap[0]), int(umap[255]), int(umap[1]), int(umap[3]), int(umap[11]), int(umap[15]))
+hist0_u = np.bincount(umap[code0.ravel()], minlength=59)
+u_nonzero = (int((hist0 > 0).sum()), int((hist0_u > 0).sum()), int(hist0_u.sum()))
+# @@end
+print("uniform 模式数 / 总 bin 数 / 前 8 个编码的映射:", u_info)
+print("特定位点映射 (编码 0, 255, 1, 3, 11, 15):", u_spot)
+print("dig0: 256 bin 里非零", u_nonzero[0], "个 -> 59 bin 里非零", u_nonzero[1], "个，计数总和", u_nonzero[2])
+print("解读: 「0/1 跳变次数 <= 2」的模式叫 **uniform（等价/均匀）模式**，共 58 个，"
+      "它们覆盖了自然图像里 90% 以上的 LBP 编码；把剩下所有非 uniform 编码塞进第 59 个桶，"
+      "特征维度就从 **256 降到 59**（降 77%），而信息几乎不丢。"
+      "注意别把编码值直接当 bin 序号：编码 11 的跳变数 (00001011) 是 4 > 2，所以它落进最后一桶 58；"
+      "编码 15 (00001111) 跳变 2 次，是合法的 uniform 模式，映射到 10")
+
+assert u_info == (58, 59, [0, 1, 2, 3, 4, 58, 5, 6])
+assert u_spot == (0, 57, 1, 3, 58, 10)
+assert u_nonzero == (47, 32, 676)
+'''
+
+E6_CODE = '''H, W = dig0.shape
+n_cell = H // CELL
+# @@todo(6) 手撕 HOG（向量化，不许写 for）：梯度 -> 方向分箱 -> cell 累加 -> block 归一化
+# @@hint 想让边界与 hog_naive 对齐，就把图 pad 1 圈（mode="edge"）再做中心差分
+# @@hint 方向取**无符号** 0~180（角度 mod 180），bin 索引 = min(ang * BINS / 180, BINS-1)
+# @@hint cell 累加别用循环：np.add.at(cells, (行号数组, 列号数组, bin索引.ravel()), 幅值.ravel())
+gp = np.pad(dig0.astype(np.float64), 1, mode="edge")
+gx = gp[1:-1, 2:] - gp[1:-1, :-2]
+gy = gp[2:, 1:-1] - gp[:-2, 1:-1]
+mag = np.hypot(gx, gy)
+ang = np.degrees(np.arctan2(gy, gx)) % 180.0
+bidx = np.minimum((ang * BINS / 180.0).astype(np.int32), BINS - 1)
+cells = np.zeros((n_cell, n_cell, BINS))
+row_idx = np.repeat(np.arange(H), W) // CELL
+col_idx = np.tile(np.arange(W), H) // CELL
+np.add.at(cells, (row_idx, col_idx, bidx.ravel()), mag.ravel())
+starts = [(by, bx) for by in range(n_cell - BLOCK + 1) for bx in range(n_cell - BLOCK + 1)]
+h_blocks = [unit(cells[by:by + BLOCK, bx:bx + BLOCK, :].ravel()) for by, bx in starts]
+f_hog = np.concatenate(h_blocks)
+hog_diff = max_abs_diff(f_hog, hog_naive(dig0))
+hog_stat = (f_hog.shape[0], round(float(np.linalg.norm(f_hog)), 6), int((f_hog > 0).sum()),
+            round(float(f_hog.max()), 6))
+hog_head = tuple(round(float(v), 6) for v in f_hog[:9])
+# @@end
+print("HOG 维度:", f_hog.shape, "| 与朴素三重循环版的逐元素最大差:", hog_diff)
+print("block 数:", len(starts), "| 特征向量 L2:", hog_stat[1], "| 非零维数:", hog_stat[2], "| 最大值:", hog_stat[3])
+print("前 9 维（第 1 个 cell 的 9 个方向）:", hog_head)
+print("维度公式: (n_cell - BLOCK + 1)^2 * BLOCK^2 * BINS =", (n_cell - 2 + 1) ** 2 * 4 * BINS)
+print("解读: HOG 的四步 —— 1) 中心差分求 gx/gy（**边界口径必须和参考实现一致**，"
+      "否则最大差 0.139 而不是 0）；2) 用**无符号**方向 0~180° 分 9 个 bin"
+      "（因为梯度正负号只反映亮度升降，共用一个 bin 更鲁棒）；"
+      "3) 按 7x7 的 cell 累加幅值；4) 2x2 的 block 滑窗 + L2 归一化（消除局部对比度影响）。"
+      "每个 block 归一化后 L2 都是 1，9 个 block 拼起来整条向量 L2 恰好 **3.0**，"
+      "这是检查实现对不对的第二个尺子（第一个是和朴素版对账）")
+
+assert hog_diff == 0.0
+assert hog_stat == (324, 3.0, 103, 0.965571)
+assert hog_head == (0.0, 0.0, 0.0, 0.0, 0.114118, 0.0, 0.0, 0.0, 0.0)
+'''
+
+E7_CODE = '''# @@todo(7) 三种特征 × 两种分类器：raw 784 像素 / HOG 324 / LBP uniform 59
+# @@hint 特征矩阵用列表推导 + np.stack([...])；raw 特征记得 /255 归一化
+# @@hint 分类器：KNeighborsClassifier(n_neighbors=3) 与 LinearSVC(C=1.0, max_iter=5000, dual="auto")
+# @@hint 每个组合只留准确率（round(accuracy_score(yte, ...), 4)），维度用 shape[1] 取
+Xtr_hog = np.stack([hog_naive(im) for im in Xtr_img])
+Xte_hog = np.stack([hog_naive(im) for im in Xte_img])
+Xtr_lbp = np.stack([np.bincount(umap[lbp8(im).ravel()], minlength=59).astype(np.float64) for im in Xtr_img])
+Xte_lbp = np.stack([np.bincount(umap[lbp8(im).ravel()], minlength=59).astype(np.float64) for im in Xte_img])
+Xtr_raw = Xtr_img.reshape(len(Xtr_img), -1).astype(np.float64) / 255.0
+Xte_raw = Xte_img.reshape(len(Xte_img), -1).astype(np.float64) / 255.0
+feat_dim = (Xtr_raw.shape[1], Xtr_hog.shape[1], Xtr_lbp.shape[1])
+acc = {}
+acc["raw784"] = (round(accuracy_score(yte, KNeighborsClassifier(n_neighbors=3).fit(Xtr_raw, ytr).predict(Xte_raw)), 4),
+                 round(accuracy_score(yte, LinearSVC(C=1.0, max_iter=5000, dual="auto").fit(Xtr_raw, ytr).predict(Xte_raw)), 4))
+acc["hog324"] = (round(accuracy_score(yte, KNeighborsClassifier(n_neighbors=3).fit(Xtr_hog, ytr).predict(Xte_hog)), 4),
+                 round(accuracy_score(yte, LinearSVC(C=1.0, max_iter=5000, dual="auto").fit(Xtr_hog, ytr).predict(Xte_hog)), 4))
+acc["lbp59"] = (round(accuracy_score(yte, KNeighborsClassifier(n_neighbors=3).fit(Xtr_lbp, ytr).predict(Xte_lbp)), 4),
+                round(accuracy_score(yte, LinearSVC(C=1.0, max_iter=5000, dual="auto").fit(Xtr_lbp, ytr).predict(Xte_lbp)), 4))
+# @@end
+print("特征维度 (raw, HOG, LBP):", feat_dim)
+for name in ("raw784", "hog324", "lbp59"):
+    print(f"   {name:8s} kNN(k=3) {acc[name][0]:.4f} | LinearSVC {acc[name][1]:.4f}")
+print("解读: 三种特征在 MNIST 上的排序很典型 —— **HOG + LinearSVC 最好（0.952）**，"
+      "原始像素 + kNN 次之（0.914），LBP + kNN 最差（0.488）。"
+      "原因：1) 手写数字的判别信息**几乎全在笔画边缘的方向分布**上，HOG 正是为这个设计的，"
+      "而 LBP 只看「邻域亮暗对比」的纹理，对笔画的**位置和走向**不敏感；"
+      "2) 原始像素做 kNN 靠的是整体形状距离，还不错，但它对微小位移极敏感，"
+      "所以换成线性 SVM 反而掉到 0.878；"
+      "3) HOG 有 block 归一化，天然做了局部对比度归一，位移鲁棒性最好")
+print("结论：**特征比分类器重要**——同一套 LinearSVC，换特征从 0.704 涨到 0.952")
+
+assert feat_dim == (784, 324, 59)
+assert acc == {"raw784": (0.914, 0.878), "hog324": (0.924, 0.952), "lbp59": (0.488, 0.704)}
+'''
+
+E8_CODE = '''# @@todo(8) HOG + LinearSVC 的混淆矩阵：每类召回、最差的那一类、最容易混的一对
+# @@hint confusion_matrix(yte, pred) 的行是真值、列是预测；每类召回 = 对角线 / 该行之和
+# @@hint 把对角线清零再取 argmax，就得到「最容易混淆的真值-预测 类别对」
+svm_hog = LinearSVC(C=1.0, max_iter=5000, dual="auto").fit(Xtr_hog, ytr)
+pred_hog = svm_hog.predict(Xte_hog)
+cm = confusion_matrix(yte, pred_hog)
+recall = tuple(round(float(v), 4) for v in cm.diagonal() / cm.sum(axis=1))
+off = cm.copy()
+np.fill_diagonal(off, 0)
+worst_pair = tuple(int(v) for v in np.unravel_index(off.argmax(), off.shape))
+cm_info = (round(float(accuracy_score(yte, pred_hog)), 4), int(off.max()), worst_pair)
+# @@end
+print("整体准确率:", cm_info[0], "| 最大单格误判数:", cm_info[1], "出现在 (真值, 预测) =", cm_info[2])
+print("每类召回率:", recall)
+print("最差类别 (召回最低):", int(np.argmin(recall)), "->", min(recall),
+      "| 最好类别:", int(np.argmax(recall)), "->", max(recall))
+print("混淆矩阵（行=真值，列=预测）:")
+print(cm)
+print("解读: 整体 0.952，但**按类看并不平均**：数字 9 的召回只有 0.807，数字 0 / 1 / 7 都在 0.98 以上。"
+      "看矩阵第 9 行：46 个 9 里有 3 个被误认成 4、3 个误认成 1、还有散落在 0/5/7/8 的 ——"
+      "9 和 4 的形态确实接近（都是闭合曲线 + 竖笔画），这是**数据集本身的难点**，不是实现 bug。"
+      "**只报一个整体准确率是不够的**：类别不均衡时它会骗人，必须看混淆矩阵和每类召回。"
+      "这也是竞赛里「模型性能评估」那 10% 的得分点")
+
+assert cm_info == (0.952, 3, (9, 1))
+assert recall == (0.9821, 0.9815, 0.9608, 0.9744, 0.9767, 0.95, 0.9583, 0.9828, 0.963, 0.807)
+assert int(np.argmin(recall)) == 9 and int(np.argmax(recall)) == 7
+'''
+
+# =========================================================================== #
+# 讲解用代码块（与练习内容一一对应，去掉挖空标记）
+# =========================================================================== #
+
+S1_CODE = '''gh = cv2.cvtColor(home, cv2.COLOR_BGR2GRAY)
+hsv = cv2.cvtColor(home, cv2.COLOR_BGR2HSV)
+hist_g = cv2.calcHist([gh], [0], None, [256], [0, 256])
+hist_bgr = [cv2.calcHist([home], [c], None, [256], [0, 256]) for c in range(3)]
+hist_hs = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+mk = np.zeros_like(gh)
+mk[:, :gh.shape[1] // 2] = 255
+hist_masked = cv2.calcHist([gh], [0], mk, [256], [0, 256])
+hn = cv2.normalize(hist_g, None, 0, 1, cv2.NORM_MINMAX)
+hl1 = cv2.normalize(hist_g, None, 1.0, 0, cv2.NORM_L1)
+h_sum = round(float(hist_g.sum()), 1)
+h_peak = (int(hist_g.argmax()), int(hist_g.max()))
+h_empty = int((hist_g == 0).sum())
+h_ch_mean = tuple(round(float(h.mean()), 1) for h in hist_bgr)
+h_hs_peak = tuple(int(v) for v in np.unravel_index(hist_hs.argmax(), hist_hs.shape))
+h_hs_count = round(float(hist_hs.max()), 1)
+h_norm = (round(float(hn.max()), 4), round(float(hl1.sum()), 6), round(float(hl1.max()), 6))
+h_mask_sum = round(float(hist_masked.sum()), 1)
+h_median = int(np.searchsorted(np.cumsum(hist_g.ravel()), 0.5 * gh.size))
+print("灰度直方图: shape", hist_g.shape, "总和", h_sum, "（= 像素数", gh.size, "）")
+print("峰值 bin:", h_peak, "| 计数为 0 的 bin 数:", h_empty)
+print("BGR 三通道直方图各自的均值:", h_ch_mean)
+print("H-S 二维直方图形状:", hist_hs.shape, "| argmax:", h_hs_peak, "计数", h_hs_count)
+print("NORM_MINMAX 后 max:", h_norm[0], "| NORM_L1 后 sum / max:", h_norm[1], h_norm[2])
+print("mask（只统计左半边）直方图总和:", h_mask_sum, "| 灰度中位数:", h_median)
+print("解读: 直方图的**总和恒等于像素数**（196608），这是自检的第一把尺子。"
+      "归一化有两种常用口径——**NORM_MINMAX 把最大值拉到 1**（形状不变、量纲变了），"
+      "**NORM_L1 把总和拉到 1**（变成概率分布）。做图间比较必须用 NORM_L1，"
+      "否则两幅尺寸不同的图根本不可比。mask 参数可以把统计限制在任意区域（这里左半边正好一半像素）")
+
+assert h_sum == 196608.0 and hist_g.shape == (256,)
+assert h_peak == (111, 3908) and h_empty == 12
+assert h_ch_mean == (768.0, 768.0, 768.0)
+assert h_hs_peak == (17, 30) and h_hs_count == 13482.0
+assert h_norm == (1.0, 1.0, 0.019877)
+assert h_mask_sum == 98304.0 and h_median == 105
+'''
+
+S2_CODE = '''METHODS = (cv2.HISTCMP_CORREL, cv2.HISTCMP_CHISQR, cv2.HISTCMP_INTERSECT, cv2.HISTCMP_BHATTACHARYYA)
+half = cv2.cvtColor(cv2.resize(home, None, fx=0.5, fy=0.5), cv2.COLOR_BGR2GRAY)
+flip = cv2.flip(gh, 1)
+rot = cv2.rotate(gh, cv2.ROTATE_90_CLOCKWISE)
+bright = cv2.convertScaleAbs(gh, alpha=1.0, beta=25)
+cam_g = cv2.cvtColor(cam, cv2.COLOR_BGR2GRAY)
+cmp_self = tuple(round(cv2.compareHist(hist_g, hist_g, m), 6) for m in METHODS)
+cmp_flip = tuple(round(cv2.compareHist(hist_g, hgt(flip), m), 6) for m in METHODS)
+cmp_rot = tuple(round(cv2.compareHist(hist_g, hgt(rot), m), 6) for m in METHODS)
+cmp_half = tuple(round(cv2.compareHist(hist_g, hgt(half), m), 6) for m in METHODS)
+cmp_bright = tuple(round(cv2.compareHist(hist_g, hgt(bright), m), 6) for m in METHODS)
+cmp_cam = tuple(round(cv2.compareHist(hist_g, hgt(cam_g), m), 6) for m in METHODS)
+n_ref = cv2.normalize(hist_g, None, 1.0, 0, cv2.NORM_L1)
+n_bright = cv2.normalize(hgt(bright), None, 1.0, 0, cv2.NORM_L1)
+cmp_bright_n = tuple(round(cv2.compareHist(n_ref, n_bright, m), 6) for m in METHODS)
+b16_ref = cv2.normalize(hgt(gh, 16), None, 1.0, 0, cv2.NORM_L1)
+b16_bri = cv2.normalize(hgt(bright, 16), None, 1.0, 0, cv2.NORM_L1)
+cmp_bright_16 = tuple(round(cv2.compareHist(b16_ref, b16_bri, m), 6) for m in METHODS)
+print("自己 vs 自己  :", cmp_self)
+print("水平翻转      :", cmp_flip)
+print("旋转 90 度    :", cmp_rot)
+print("缩小 0.5 倍   :", cmp_half)
+print("提亮 +25      :", cmp_bright)
+print("换图 camera   :", cmp_cam)
+print("提亮 +25（先 NORM_L1）:", cmp_bright_n)
+print("提亮 +25（降到 16 bin）:", cmp_bright_16)
+print("解读: 三个结论 —— 1) **水平翻转、旋转 90 度与自身完全相同**（差 0.0）："
+      "直方图是「灰度分布」，**完全不含空间信息**，所以它对平移/旋转/翻转免疫；"
+      "2) `INTERSECT` 与 `CHISQR` 受**直方图尺度**影响（自己 vs 自己 INTERSECT=196608，"
+      "缩小 0.5 倍就只剩 49152），必须先 NORM_L1 归一化再比（提亮 +25 的 CHISQR 从 674103.7 变成 3.43）；"
+      "3) 提亮 +25 后 CORREL 只剩 0.28 —— 全局灰度偏移对直方图特征破坏极大，"
+      "这也解释了为什么前面要学**直方图均衡化**")
+
+assert cmp_self == (1.0, 0.0, 196608.0, 0.0)
+assert cmp_flip == (1.0, 0.0, 196608.0, 0.0)
+assert cmp_rot == (1.0, 0.0, 196608.0, 0.0)
+assert cmp_half == (0.996797, 110738.219957, 49152.0, 0.047981)
+assert cmp_bright == (0.28219, 674103.707624, 112471.0, 0.408864)
+assert cmp_cam == (-0.27512, 2684844.853327, 77870.0, 0.571194)
+assert cmp_bright_n == (0.28219, 3.428669, 0.572057, 0.408864)
+assert cmp_bright_16 == (0.357977, 3.136961, 0.59904, 0.368519)
+'''
+
+S3_CODE = '''low = cv2.normalize(gh, None, 60, 200, cv2.NORM_MINMAX)
+eq = cv2.equalizeHist(low)
+clahe2 = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(low)
+clahe40 = cv2.createCLAHE(clipLimit=40.0, tileGridSize=(8, 8)).apply(low)
+ycc = cv2.cvtColor(home, cv2.COLOR_BGR2YCrCb)
+ycc[:, :, 0] = cv2.equalizeHist(ycc[:, :, 0])
+eq_y = cv2.cvtColor(ycc, cv2.COLOR_YCrCb2BGR)
+eq_per_ch = np.dstack([cv2.equalizeHist(home[:, :, i]) for i in range(3)])
+std_pair = (round(float(low.std()), 4), round(float(eq.std()), 4))
+empty_pair = (int((hgt(low) == 0).sum()), int((hgt(eq) == 0).sum()))
+eq_stat = (round(float(eq.mean()), 4), len(np.unique(eq)), int(eq.min()), int(eq.max()))
+clahe_std = (round(float(clahe2.std()), 4), round(float(clahe40.std()), 4))
+d_clahe = (int(np.abs(clahe2.astype(int) - eq.astype(int)).max()),
+           int(np.abs(clahe2.astype(int) - clahe40.astype(int)).max()))
+y_vs_ch = (int(np.abs(eq_y.astype(int) - eq_per_ch.astype(int)).max()),
+           round(float(np.abs(eq_y.astype(int) - eq_per_ch.astype(int)).mean()), 4))
+print("压缩到 [60, 200] 后的 std:", std_pair[0], "-> equalizeHist 后:", std_pair[1])
+print("0 计数 bin 数:", empty_pair[0], "->", empty_pair[1], "（变多了！）")
+print("均衡化后: 均值", eq_stat[0], "唯一值数", eq_stat[1], "范围", eq_stat[2], "~", eq_stat[3])
+print("CLAHE clipLimit=2 / 40 的 std:", clahe_std)
+print("CLAHE(clip2) vs equalizeHist 最大差:", d_clahe[0], "| clip2 vs clip40 最大差:", d_clahe[1])
+print("只均衡 Y 通道 vs 三通道各自均衡: 最大差", y_vs_ch[0], "平均差", y_vs_ch[1])
+print("解读: equalizeHist 把 CDF 拉直，std 从 25.33 冲到 73.07 —— 对比度是「暴力」拉满的；"
+      "CLAHE 按 8x8 分块 + 裁剪（clipLimit），明显温和（std 39.17 / 56.83），"
+      "clipLimit 越大越接近全局均衡化（两者最大差 113）。"
+      "**注意「0 计数 bin 从 119 涨到 161」**：均衡化把大量灰阶挤到同一档，"
+      "bin 变空不是 bug，是映射太陡的副作用。"
+      "彩色图必须**只均衡亮度通道**（YCrCb 的 Y 或 Lab 的 L）——"
+      "三通道各自均衡会打乱色彩平衡（与本条实现平均差 24.07、最大差 113）")
+
+assert std_pair == (25.3296, 73.0745)
+assert empty_pair == (119, 161)
+assert eq_stat == (129.617, 95, 0, 255)
+assert clahe_std == (39.1719, 56.8262) and d_clahe == (93, 113) and y_vs_ch == (113, 24.0668)
+'''
+
+S4_CODE = '''def lbp8(img):
+    """8 邻域 LBP：邻域灰度 >= 中心记 1，按 OFFSETS 顺序从低位到高位拼成 uint8。"""
+    g = img.astype(np.int16)
+    c = g[1:-1, 1:-1]
+    shifts = [g[1 + dy:g.shape[0] - 1 + dy, 1 + dx:g.shape[1] - 1 + dx] for dy, dx in OFFSETS]
+    nb = np.stack(shifts)
+    w = (1 << np.arange(8)).astype(np.uint8).reshape(8, 1, 1)
+    code = ((nb >= c).astype(np.uint8) * w).sum(axis=0).astype(np.uint8)
+    return code
+
+
+code0 = lbp8(dig0)
+hist0 = np.bincount(code0.ravel(), minlength=256)
+lbp_stat = (code0.shape, str(code0.dtype), int(code0.max()), len(np.unique(code0)), int(hist0.sum()))
+pat = (np.arange(28 * 28).reshape(28, 28) * 7 % 171).astype(np.uint8)
+pat_shift = (pat.astype(np.int16) + 85).astype(np.uint8)
+pat_clip = np.clip(pat.astype(np.int16) + 150, 0, 255).astype(np.uint8)
+lbp_inv = (int(np.abs(lbp8(pat).astype(int) - lbp8(pat_shift).astype(int)).max()),
+           int(np.abs(lbp8(pat).astype(int) - lbp8(pat_clip).astype(int)).max()))
+lbp_geom = (int(np.abs(lbp8(pat).astype(int) - lbp8(np.fliplr(pat)).astype(int)).max()),
+            int(np.abs(lbp8(dig0).astype(int) - np.rot90(lbp8(np.rot90(dig0, 1))).astype(int)).max()))
+lbp_top = [(int(i), int(v)) for i, v in sorted(enumerate(hist0), key=lambda t: -t[1])[:3]]
+print("LBP 输出 (shape, dtype, max, 唯一值数, 直方图总和):", lbp_stat)
+print("灰度平移不变性: 无截断 +85 最大差", lbp_inv[0], "| 有截断 +150 最大差", lbp_inv[1])
+print("几何变换敏感性: 水平镜像最大差", lbp_geom[0], "| 90 度旋转最大差", lbp_geom[1])
+print("dig0 的 LBP 直方图 top3 (编码, 计数):", lbp_top)
+print("解读: LBP 的编码过程只用到**比较**（>=），所以对任意**严格单调**的灰度变换完全不变 ——"
+      "实测把图案整体 +85（值域 85~255，无截断）后 LBP 逐像素差 **0**。"
+      "但一旦**发生截断**（+150 把亮区压到 255），大小关系被破坏，差立刻变成 135。"
+      "另外 LBP 只在「灰度」维度不变：镜像 / 旋转 90 度后编码完全不同（差 255），"
+      "因为它把邻域方向也编码进去了。"
+      "dig0 里 676 个编码有 **554 个是 255**（整片背景全是同一灰度），"
+      "所以原始 LBP 直方图极度不平衡 —— 这就是下一步要降维的原因")
+
+assert lbp_stat == ((26, 26), "uint8", 255, 47, 676)
+assert lbp_inv == (0, 135) and lbp_geom == (255, 255)
+assert lbp_top == [(255, 554), (195, 16), (60, 13)]
+'''
+
+S5_CODE = '''vals = np.arange(256, dtype=np.uint8)
+bits = ((vals[:, None] >> np.arange(8)) & 1).astype(np.int8)
+trans = (bits != np.roll(bits, -1, axis=1)).sum(axis=1)
+umap = np.zeros(256, np.int32)
+umap[trans <= 2] = np.arange(int((trans <= 2).sum()))
+umap[trans > 2] = int((trans <= 2).sum())
+u_info = (int((trans <= 2).sum()), int(umap.max()) + 1, umap[:8].tolist())
+u_spot = (int(umap[0]), int(umap[255]), int(umap[1]), int(umap[3]), int(umap[11]), int(umap[15]))
+hist0_u = np.bincount(umap[code0.ravel()], minlength=59)
+u_nonzero = (int((hist0 > 0).sum()), int((hist0_u > 0).sum()), int(hist0_u.sum()))
+print("uniform 模式数 / 总 bin 数 / 前 8 个编码的映射:", u_info)
+print("特定位点映射 (编码 0, 255, 1, 3, 11, 15):", u_spot)
+print("dig0: 256 bin 里非零", u_nonzero[0], "个 -> 59 bin 里非零", u_nonzero[1], "个，计数总和", u_nonzero[2])
+print("解读: 「0/1 跳变次数 <= 2」的模式叫 **uniform（等价/均匀）模式**，共 58 个，"
+      "它们覆盖了自然图像里 90% 以上的 LBP 编码；把剩下所有非 uniform 编码塞进第 59 个桶，"
+      "特征维度就从 **256 降到 59**（降 77%），而信息几乎不丢。"
+      "注意别把编码值直接当 bin 序号：编码 11 的跳变数 (00001011) 是 4 > 2，所以它落进最后一桶 58；"
+      "编码 15 (00001111) 跳变 2 次，是合法的 uniform 模式，映射到 10")
+
+assert u_info == (58, 59, [0, 1, 2, 3, 4, 58, 5, 6])
+assert u_spot == (0, 57, 1, 3, 58, 10)
+assert u_nonzero == (47, 32, 676)
+'''
+
+S6_CODE = '''H, W = dig0.shape
+n_cell = H // CELL
+gp = np.pad(dig0.astype(np.float64), 1, mode="edge")
+gx = gp[1:-1, 2:] - gp[1:-1, :-2]
+gy = gp[2:, 1:-1] - gp[:-2, 1:-1]
+mag = np.hypot(gx, gy)
+ang = np.degrees(np.arctan2(gy, gx)) % 180.0
+bidx = np.minimum((ang * BINS / 180.0).astype(np.int32), BINS - 1)
+cells = np.zeros((n_cell, n_cell, BINS))
+row_idx = np.repeat(np.arange(H), W) // CELL
+col_idx = np.tile(np.arange(W), H) // CELL
+np.add.at(cells, (row_idx, col_idx, bidx.ravel()), mag.ravel())
+starts = [(by, bx) for by in range(n_cell - BLOCK + 1) for bx in range(n_cell - BLOCK + 1)]
+h_blocks = [unit(cells[by:by + BLOCK, bx:bx + BLOCK, :].ravel()) for by, bx in starts]
+f_hog = np.concatenate(h_blocks)
+hog_diff = max_abs_diff(f_hog, hog_naive(dig0))
+hog_stat = (f_hog.shape[0], round(float(np.linalg.norm(f_hog)), 6), int((f_hog > 0).sum()),
+            round(float(f_hog.max()), 6))
+hog_head = tuple(round(float(v), 6) for v in f_hog[:9])
+print("HOG 维度:", f_hog.shape, "| 与朴素三重循环版的逐元素最大差:", hog_diff)
+print("block 数:", len(starts), "| 特征向量 L2:", hog_stat[1], "| 非零维数:", hog_stat[2], "| 最大值:", hog_stat[3])
+print("前 9 维（第 1 个 cell 的 9 个方向）:", hog_head)
+print("维度公式: (n_cell - BLOCK + 1)^2 * BLOCK^2 * BINS =", (n_cell - 2 + 1) ** 2 * 4 * BINS)
+print("解读: HOG 的四步 —— 1) 中心差分求 gx/gy（**边界口径必须和参考实现一致**，"
+      "否则最大差 0.139 而不是 0）；2) 用**无符号**方向 0~180° 分 9 个 bin"
+      "（因为梯度正负号只反映亮度升降，共用一个 bin 更鲁棒）；"
+      "3) 按 7x7 的 cell 累加幅值；4) 2x2 的 block 滑窗 + L2 归一化（消除局部对比度影响）。"
+      "每个 block 归一化后 L2 都是 1，9 个 block 拼起来整条向量 L2 恰好 **3.0**，"
+      "这是检查实现对不对的第二个尺子（第一个是和朴素版对账）")
+
+assert hog_diff == 0.0
+assert hog_stat == (324, 3.0, 103, 0.965571)
+assert hog_head == (0.0, 0.0, 0.0, 0.0, 0.114118, 0.0, 0.0, 0.0, 0.0)
+'''
+
+S7_CODE = '''Xtr_hog = np.stack([hog_naive(im) for im in Xtr_img])
+Xte_hog = np.stack([hog_naive(im) for im in Xte_img])
+Xtr_lbp = np.stack([np.bincount(umap[lbp8(im).ravel()], minlength=59).astype(np.float64) for im in Xtr_img])
+Xte_lbp = np.stack([np.bincount(umap[lbp8(im).ravel()], minlength=59).astype(np.float64) for im in Xte_img])
+Xtr_raw = Xtr_img.reshape(len(Xtr_img), -1).astype(np.float64) / 255.0
+Xte_raw = Xte_img.reshape(len(Xte_img), -1).astype(np.float64) / 255.0
+feat_dim = (Xtr_raw.shape[1], Xtr_hog.shape[1], Xtr_lbp.shape[1])
+acc = {}
+acc["raw784"] = (round(accuracy_score(yte, KNeighborsClassifier(n_neighbors=3).fit(Xtr_raw, ytr).predict(Xte_raw)), 4),
+                 round(accuracy_score(yte, LinearSVC(C=1.0, max_iter=5000, dual="auto").fit(Xtr_raw, ytr).predict(Xte_raw)), 4))
+acc["hog324"] = (round(accuracy_score(yte, KNeighborsClassifier(n_neighbors=3).fit(Xtr_hog, ytr).predict(Xte_hog)), 4),
+                 round(accuracy_score(yte, LinearSVC(C=1.0, max_iter=5000, dual="auto").fit(Xtr_hog, ytr).predict(Xte_hog)), 4))
+acc["lbp59"] = (round(accuracy_score(yte, KNeighborsClassifier(n_neighbors=3).fit(Xtr_lbp, ytr).predict(Xte_lbp)), 4),
+                round(accuracy_score(yte, LinearSVC(C=1.0, max_iter=5000, dual="auto").fit(Xtr_lbp, ytr).predict(Xte_lbp)), 4))
+print("特征维度 (raw, HOG, LBP):", feat_dim)
+for name in ("raw784", "hog324", "lbp59"):
+    print(f"   {name:8s} kNN(k=3) {acc[name][0]:.4f} | LinearSVC {acc[name][1]:.4f}")
+print("解读: 三种特征在 MNIST 上的排序很典型 —— **HOG + LinearSVC 最好（0.952）**，"
+      "原始像素 + kNN 次之（0.914），LBP + kNN 最差（0.488）。"
+      "原因：1) 手写数字的判别信息**几乎全在笔画边缘的方向分布**上，HOG 正是为这个设计的，"
+      "而 LBP 只看「邻域亮暗对比」的纹理，对笔画的**位置和走向**不敏感；"
+      "2) 原始像素做 kNN 靠的是整体形状距离，还不错，但它对微小位移极敏感，"
+      "所以换成线性 SVM 反而掉到 0.878；"
+      "3) HOG 有 block 归一化，天然做了局部对比度归一，位移鲁棒性最好")
+print("结论：**特征比分类器重要**——同一套 LinearSVC，换特征从 0.704 涨到 0.952")
+
+assert feat_dim == (784, 324, 59)
+assert acc == {"raw784": (0.914, 0.878), "hog324": (0.924, 0.952), "lbp59": (0.488, 0.704)}
+'''
+
+S8_CODE = '''svm_hog = LinearSVC(C=1.0, max_iter=5000, dual="auto").fit(Xtr_hog, ytr)
+pred_hog = svm_hog.predict(Xte_hog)
+cm = confusion_matrix(yte, pred_hog)
+recall = tuple(round(float(v), 4) for v in cm.diagonal() / cm.sum(axis=1))
+off = cm.copy()
+np.fill_diagonal(off, 0)
+worst_pair = tuple(int(v) for v in np.unravel_index(off.argmax(), off.shape))
+cm_info = (round(float(accuracy_score(yte, pred_hog)), 4), int(off.max()), worst_pair)
+print("整体准确率:", cm_info[0], "| 最大单格误判数:", cm_info[1], "出现在 (真值, 预测) =", cm_info[2])
+print("每类召回率:", recall)
+print("最差类别 (召回最低):", int(np.argmin(recall)), "->", min(recall),
+      "| 最好类别:", int(np.argmax(recall)), "->", max(recall))
+print("混淆矩阵（行=真值，列=预测）:")
+print(cm)
+print("解读: 整体 0.952，但**按类看并不平均**：数字 9 的召回只有 0.807，数字 0 / 1 / 7 都在 0.98 以上。"
+      "看矩阵第 9 行：46 个 9 里有 3 个被误认成 4、3 个误认成 1、还有散落在 0/5/7/8 的 ——"
+      "9 和 4 的形态确实接近（都是闭合曲线 + 竖笔画），这是**数据集本身的难点**，不是实现 bug。"
+      "**只报一个整体准确率是不够的**：类别不均衡时它会骗人，必须看混淆矩阵和每类召回。"
+      "这也是竞赛里「模型性能评估」那 10% 的得分点")
+
+assert cm_info == (0.952, 3, (9, 1))
+assert recall == (0.9821, 0.9815, 0.9608, 0.9744, 0.9767, 0.95, 0.9583, 0.9828, 0.963, 0.807)
+assert int(np.argmin(recall)) == 9 and int(np.argmax(recall)) == 7
+'''
+
+# =========================================================================== #
+# 讲解 notebook
+# =========================================================================== #
+
+LESSON = [
+    md(
+        """
+# ch07 图像特征与分类
+
+> 数据：`classic/home.jpg`、`camera.png` + `mnist/` 子集（2000 训练 / 500 测试）。
+> 真值全部实跑（opencv 5.0.0 / scikit-learn 1.9.1）。
+
+**本仓环境的一个事实（决定了本章怎么写）**
+
+- **没有 `skimage`**，`cv2.HOGDescriptor` 在 OpenCV 5 主模块里**已被移除** → LBP / HOG 全部**手撕**
+- 手撕反而更贴合竞赛：特征算子要能自己写出来，而不是只会调 API
+- HOG 额外提供 `hog_naive`（朴素三重循环版）作为**对账基准**（同 ch04 的 `correlate_zero_pad` 思路）
+
+**本章考点**
+
+1. `calcHist` 的三种形态：单通道 / 多通道 / 带 mask；以及 **NORM_MINMAX vs NORM_L1**
+2. `compareHist` 四种方法，以及「直方图不含空间信息」这个根本性质
+3. `equalizeHist` vs `CLAHE`；彩色图**只能均衡亮度通道**
+4. **手撕 8 邻域 LBP**：灰度不变性的边界（无截断才成立）
+5. **LBP uniform 模式**：256 → 59 维
+6. **手撕 HOG**：梯度 → 无符号方向分箱 → cell 累加 → block L2 归一化
+7. 三种特征（raw / HOG / LBP）× 两种分类器（kNN / LinearSVC）的实测排序
+8. 混淆矩阵与每类召回 —— **只报整体准确率是不够的**
+
+**难点索引**
+
+| 难点 | 为什么是坑 | 位置 |
+|---|---|---|
+| 直方图尺度 | 不归一化时 INTERSECT/CHISQR 无意义 | §7.2 |
+| 直方图丢空间信息 | 翻转/旋转 90° 与自身完全相同 | §7.2 |
+| 均衡化的副作用 | 0 计数 bin 反而从 119 涨到 161 | §7.3 |
+| 彩色图均衡化 | 三通道各自均衡会毁色彩（平均差 24.07） | §7.3 |
+| LBP 的"不变性"边界 | 无截断才不变（+85 差 0，+150 差 135） | §7.4 |
+| LBP 不平衡 | dig0 有 554/676 个编码都是 255 | §7.4 |
+| uniform 映射 | 编码值 ≠ bin 序号（11 → 58，15 → 10） | §7.5 |
+| HOG 边界口径 | 口径不一致最大差 0.139 而不是 0 | §7.6 |
+| 特征 vs 分类器 | 同分类器换特征 0.704 → 0.952 | §7.7 |
+| 整体准确率骗人 | 整体 0.952 但数字 9 只有 0.807 | §7.8 |
+"""
+    ),
+    code(IMPORTS),
+    code(SETUP),
+    code(SCAFFOLD),
+    md(
+        """
+## 7.1 颜色直方图
+
+`cv2.calcHist([img], [ch], mask, [bins], [lo, hi])` 四个关键位置：
+
+| 形态 | 写法 | 真值 |
+|---|---|---|
+| 灰度单通道 | `([gh], [0], None, [256], [0, 256])` | shape `(256,)`，总和 **196608**（= 像素数） |
+| BGR 多通道 | `([home], [c], ...)`，c=0/1/2 | 三个通道各自求和都是 196608 |
+| H-S 二维 | `([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])` | shape `(30, 32)`，argmax **(17, 30)**，计数 13482 |
+| 带 mask | `mask` 必须与图像**同尺寸** | 左半边 = **98304**（正好一半） |
+
+`home` 灰度直方图峰值在 bin **111**（计数 3908），有 **12** 个 bin 完全为空；
+累积和到 50% 对应灰度 **105**（就是中位数）。
+
+两种归一化别搞混：
+
+| 方法 | 效果 | 实测 |
+|---|---|---|
+| `NORM_MINMAX, 0, 1` | 最大值 → 1 | max = 1.0（形状不变） |
+| `NORM_L1, 1.0` | 总和 → 1 | sum = 1.0，max = 0.019877（变成概率分布） |
+
+**跨图比较必须用 `NORM_L1`**，否则图尺寸不同就完全不可比。
+"""
+    ),
+    code(S1_CODE),
+    md(
+        """
+## 7.2 `compareHist` 四种方法
+
+对 `home` 灰度直方图做五种变换，四种方法各比一遍：
+
+| 变换 | CORREL ↑ | CHISQR ↓ | INTERSECT ↑ | BHATTACHARYYA ↓ |
+|---|---|---|---|---|
+| 自己 vs 自己 | 1.0 | 0.0 | 196608.0 | 0.0 |
+| **水平翻转** | **1.0** | **0.0** | **196608.0** | **0.0** |
+| **旋转 90°** | **1.0** | **0.0** | **196608.0** | **0.0** |
+| 缩小 0.5 倍 | 0.996797 | 110738.219957 | 49152.0 | 0.047981 |
+| 提亮 +25 | 0.282190 | 674103.707624 | 112471.0 | 0.408864 |
+| 换图 camera | −0.275120 | 2684844.853327 | 77870.0 | 0.571194 |
+
+三个结论：
+
+1. **翻转 / 旋转 90° 与自身完全相同** → 直方图**完全不含空间信息**（是优点也是缺点：
+   对旋转平移免疫，但也无法区分「猫在左」和「猫在右」）。
+2. `INTERSECT` 与 `CHISQR` **受直方图尺度影响**（自己比自己 INTERSECT = 196608，缩小一半只剩 49152）
+   → 先 `NORM_L1` 再比：提亮 +25 的 CHISQR 从 **674103.7** 降到 **3.428669**。
+3. 提亮 +25 后 CORREL 只剩 **0.282** —— 全局灰度偏移对直方图特征破坏极大。
+
+另外，降到 16 bin 再比，CORREL 会从 0.282 回到 **0.358**（粗直方图对亮度偏移更宽容）。
+"""
+    ),
+    code(S2_CODE),
+    md(
+        """
+## 7.3 直方图均衡化与 CLAHE
+
+先把 `home` 压到 `[60, 200]`（模拟低对比度），再试三种增强：
+
+| 方法 | std | 说明 |
+|---|---|---|
+| 压缩后原图 | **25.3296** | min/max = 60/200 |
+| `equalizeHist` | **73.0745** | 最暴力，均值 129.617、只有 95 个不同灰阶 |
+| `CLAHE(clipLimit=2)` | **39.1719** | 温和 |
+| `CLAHE(clipLimit=40)` | **56.8262** | 接近全局均衡化 |
+
+两个反直觉的点：
+
+- **0 计数 bin 数从 119 涨到 161**：均衡化把大量灰阶挤到同一档，bin 变空不是 bug，
+  而是映射太陡的副作用。
+- `CLAHE(clip2)` 与 `equalizeHist` 最大差 **93**，`clip2` 与 `clip40` 差 **113**
+  → `clipLimit` 就是「局部均衡化的强度」旋钮。
+
+**彩色图必须只均衡亮度通道**：转到 `YCrCb` 只对 Y 做 `equalizeHist`，
+与「三通道各自均衡」相比平均差 **24.07**、最大差 **113** —— 后者会直接把白平衡搞坏。
+"""
+    ),
+    code(S3_CODE),
+    md(
+        """
+## 7.4 手撕 8 邻域 LBP
+
+```
+code(x) = Σ_{p=0..7} [ g(neighbor_p) >= g(x) ] · 2^p
+```
+
+输出比输入小一圈（28×28 → **26×26**），uint8，dig0 上有 **47** 个不同编码。
+
+| 实验 | 结果 | 含义 |
+|---|---|---|
+| 整体 **+85**（值域 85~255，无截断） | 逐像素差 **0** | 严格单调变换下 **LBP 完全不变** |
+| 整体 **+150**（发生截断） | 逐像素差 **135** | **不变性被截断破坏** |
+| 水平镜像 | 差 **255** | LBP 编码了方向 → **不是旋转不变** |
+| 旋转 90° | 差 **255** | 同上 |
+
+dig0 的 LBP 直方图极度不平衡：top3 是 `(255, 554)`、`(195, 16)`、`(60, 13)` ——
+676 个编码里 **554 个都是 255**（整片背景灰度相同）。
+
+> 结论：LBP 的「灰度不变性」有前提（**单调且不饱和**）；
+> 它编码纹理，但**不编码位置和朝向**。
+"""
+    ),
+    code(S4_CODE),
+    md(
+        """
+## 7.5 LBP uniform 模式降维
+
+「0/1 跳变次数 ≤ 2」的编码叫 **uniform（等价）模式**，共 **58** 个；
+剩下全部归入第 59 个桶：
+
+| 项 | 值 |
+|---|---|
+| uniform 模式数 | **58** |
+| 总 bin 数 | **59** |
+| `umap[0..7]` | `[0, 1, 2, 3, 4, 58, 5, 6]` |
+| 编码 0 / 255 | → **0** / **57** |
+| 编码 1 / 3 / 15 | → 1 / 3 / 10（合法 uniform） |
+| 编码 11（`00001011`，跳变 4 次） | → **58**（非 uniform） |
+
+dig0 上：256 bin 里非零 **47** 个 → 59 bin 里非零 **32** 个，计数总和仍 676。
+维度降 **77%**，信息几乎不丢（uniform 模式覆盖自然图像 90%+ 的编码）。
+
+> 注意 **编码值 ≠ bin 序号**，必须查表映射。
+"""
+    ),
+    code(S5_CODE),
+    md(
+        """
+## 7.6 手撕 HOG
+
+四步：
+
+1. **梯度**：中心差分。边界采用 **最近邻复制**（`np.pad(..., mode="edge")`），
+   **必须与参考实现口径一致** —— 不一致时最大差 **0.139**，一致时 **0**
+2. **方向分箱**：**无符号** 0~180° 分 9 个 bin（梯度正负号只反映亮度升降，共用一桶更鲁棒）
+3. **cell 累加**：7×7 的 cell，按方向把梯度幅值累加（用 `np.add.at` 避免 Python 循环）
+4. **block 归一化**：2×2 个 cell 滑窗，L2 归一化
+
+| 项 | 值 |
+|---|---|
+| 维度 | (4−2+1)² × 2² × 9 = **324** |
+| 与 `hog_naive` 逐元素最大差 | **0.0** |
+| 整条向量 L2 | **3.0**（= 9 个 block，每个单位范数） |
+| 非零维数 | 103 / 324 |
+| 最大值 | 0.965571 |
+
+**两个自检尺子**：① 与朴素三重循环版对账；② 整条向量 L2 == block 数。
+"""
+    ),
+    code(S6_CODE),
+    md(
+        """
+## 7.7 三种特征 × 两种分类器
+
+MNIST 子集（2000 训练 / 500 测试）：
+
+| 特征 | 维度 | kNN(k=3) | LinearSVC |
+|---|---|---|---|
+| 原始像素 `/255` | 784 | **0.914** | 0.878 |
+| **HOG** | 324 | 0.924 | **0.952** |
+| LBP uniform | 59 | 0.488 | 0.704 |
+
+- **手写数字的判别信息几乎全在笔画边缘的方向分布上** → HOG 天然占优
+- LBP 只看「邻域亮暗对比」的纹理，**对笔画的位置与走向不敏感** → 最差
+- 原始像素做 kNN 靠整体形状距离还不错；换成线性 SVM 反而掉（对微小位移敏感）
+- HOG 的 block 归一化等价于局部对比度归一 → 位移鲁棒性最好
+
+> **特征比分类器重要**：同一套 `LinearSVC`，换特征从 **0.704** 涨到 **0.952**。
+"""
+    ),
+    code(S7_CODE),
+    md(
+        """
+## 7.8 混淆矩阵与每类召回
+
+HOG + LinearSVC 在 500 个测试样本上整体准确率 **0.952**，但分到每一类就不平均了：
+
+| 真实数字 | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 召回率 | **0.9821** | 0.9815 | 0.9608 | 0.9744 | 0.9767 | 0.950 | 0.9583 | 0.9828 | 0.963 | **0.807** |
+
+最大单格误判数是 **3**，出现在 `(真值 9, 预测 1)`；矩阵第 9 行还有 3 个 9 被认成 4。
+
+**数字 9 最难**（0.807）：9 与 4/1 的形态确实接近（闭合曲线 + 竖笔画），
+这是**数据集本身的难点**，不是实现 bug。
+
+> **只报一个整体准确率是不够的**：类别不均衡时它会骗人，必须看混淆矩阵和每类召回。
+> 这正是竞赛里「模型性能评估」那 10% 的得分点。
+"""
+    ),
+    code(S8_CODE),
+    md(
+        """
+## 小结
+
+1. 直方图总和 = 像素数；`mask` 必须与图像同尺寸。
+2. **跨图比较必须 `NORM_L1`**：不归一化时 `INTERSECT`/`CHISQR` 毫无意义（674103.7 → 3.43）。
+3. **直方图不含空间信息**：翻转、旋转 90° 与自身完全相同（差 0.0）。
+4. 全局提亮 +25 就把 CORREL 打到 0.282 —— 亮度偏移是直方图特征的天敌。
+5. `equalizeHist` 暴力（std 25.33 → 73.07），`CLAHE` 温和（39.17），`clipLimit` 是强度旋钮。
+6. 均衡化会让**空 bin 变多**（119 → 161），不是 bug。
+7. **彩色图只均衡 Y/L 通道**，三通道各自均衡平均差 24.07。
+8. LBP 只做**比较**运算 → 严格单调灰度变换下完全不变（+85 差 0）；
+   但**截断会破坏不变性**（+150 差 135）。
+9. LBP **不是旋转不变**（镜像/旋转 90° 差 255）；dig0 有 554/676 个编码都是 255。
+10. uniform 模式 58 个 + 1 个兜底桶 = **59 维**（原 256，降 77%）；**编码值 ≠ bin 序号**。
+11. HOG 维度 = `(n_cell−b+1)² × b² × bins = 324`；**块归一化后整条向量 L2 = block 数**。
+12. HOG 的边界口径必须与参考实现一致，否则差 0.139 而不是 0。
+13. **特征比分类器重要**：同分类器换特征 0.704 → 0.952。
+14. **整体准确率会骗人**：0.952 的整体下，数字 9 只有 0.807。
+"""
+    ),
+]
+
+# =========================================================================== #
+# 练习 notebook
+# =========================================================================== #
+
+EXERCISE = [
+    md(
+        """
+# ch07 图像特征与分类（练习版）
+
+> 按提示补全 `____`，跑通所有 assert。`home` / `cam` / `Xtr_img, ytr` / `Xte_img, yte` /
+> `dig0` 已在 setup 里备好；`hgt` / `unit` / `max_abs_diff` / `hog_naive` 脚手架可用。
+>
+> 注意：挖空块内每条语句保持**单行**；控制流写在挖空块之外
+> （要写函数时，`def` 与 `return` 已经给好，你只填函数体，且**不许用 for**）。
+> 题目真值都来自实跑（opencv 5.0.0 / scikit-learn 1.9.1）。
+"""
+    ),
+    code(IMPORTS),
+    code(SETUP),
+    code(SCAFFOLD),
+    md("## 任务 1：颜色直方图\n\n三种形态 + 两种归一化 + mask + 中位数。"),
+    code(E1_CODE),
+    md("## 任务 2：`compareHist`\n\n四种方法 × 五种变换，重点看翻转/旋转。"),
+    code(E2_CODE),
+    md("## 任务 3：均衡化与 CLAHE\n\n全局均衡 vs 分块裁剪，以及彩色图怎么处理。"),
+    code(E3_CODE),
+    md("## 任务 4：手撕 LBP\n\n8 邻域编码 + 灰度不变性的边界。"),
+    code(E4_CODE),
+    md("## 任务 5：LBP uniform 降维\n\n256 个编码怎么压到 59 维。"),
+    code(E5_CODE),
+    md("## 任务 6：手撕 HOG\n\n梯度 → 分箱 → cell 累加 → block 归一化，与朴素版对账。"),
+    code(E6_CODE),
+    md("## 任务 7：三种特征 × 两种分类器\n\nraw / HOG / LBP，kNN 与 LinearSVC。"),
+    code(E7_CODE),
+    md("## 任务 8：混淆矩阵\n\n每类召回、最差类别、最易混的类别对。"),
+    code(E8_CODE),
+    md(
+        """
+## 自查清单
+
+- [ ] 知道直方图总和恒等于像素数，mask 必须同尺寸
+- [ ] 说得清 NORM_MINMAX 与 NORM_L1 的区别，以及何时必须用后者
+- [ ] 记得翻转/旋转 90° 不改变直方图
+- [ ] 知道 `equalizeHist` 会让空 bin 变多
+- [ ] 知道彩色图只能均衡亮度通道（YCrCb 的 Y）
+- [ ] 能默写 LBP 的编码公式与权重
+- [ ] 说得清 LBP 灰度不变性的前提（单调且不饱和）
+- [ ] 知道 LBP 不是旋转不变的
+- [ ] 会做 uniform 模式映射（58 + 1 桶）
+- [ ] 能写出 HOG 的四步，并算出一个 28×28 图的 HOG 维度
+- [ ] 知道 HOG 用无符号方向的原因
+- [ ] 知道 HOG 边界口径不一致会差 0.139
+- [ ] 能说出三种特征在 MNIST 上的排序及原因
+- [ ] 会用混淆矩阵和每类召回解释「整体准确率骗人」
+"""
+    ),
+]
+
+if __name__ == "__main__":
+    stats = build(OUT, NAME, lesson=LESSON, exercise=EXERCISE)
+    report([stats])

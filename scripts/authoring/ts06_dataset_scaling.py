@@ -1,0 +1,1222 @@
+#!/usr/bin/env python3
+"""ch06 —— 数据构造与标准化：滑窗 Dataset / DataLoader / 防泄漏缩放 / TimeSeriesSplit
+
+本章主线（六条）：
+
+1. **手写 `WindowDataset`**（`window` / `horizon` / `stride`）：单序列必须**按实体分组**切窗，
+   窗口绝不能跨越两个台区的边界 —— 那 95 个跨界样本是「实体泄漏」，也是 ch05 切分处 `gap` 的另一面
+2. **`DataLoader` 与形状**：`(B, window, F)` 进、`(B, horizon)` 出；`shuffle=True` 在时序上的
+   合法边界（训练集**内**可以打乱，但**切分**绝不能打乱）
+3. **防泄漏的缩放**：手写 `fit/apply` 的 z-score 与 min-max 两套，量化「训练段拟合 vs 全量拟合」
+   在测试段上的 MAE 差 —— **本数据上这是一个负结果（1e-5 量级）**，原因写清
+4. **手写 `TimeSeriesSplit`** 并与 `sklearn.model_selection.TimeSeriesSplit` 逐折对账，
+   讲清 `gap` 参数到底削掉了什么
+5. **滑窗 vs 扩展窗（expanding window）**：两种滚动的取舍，用 4 折 MAE 实测
+6. 本章小结：数据构造的三条纪律
+
+数据：`data/load_curve.csv`（A 居民型 / B 工业型，各 8760 h）+ `data/pv_power.csv`（8760 h × 3 特征）
+生成命令：
+    /Users/luolinjie/miniconda3/envs/self/bin/python scripts/authoring/ts06_dataset_scaling.py
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from nb_builder import build, code, md, report  # noqa: E402
+
+OUT = Path(__file__).resolve().parents[2] / "coding" / "05_timeseries"
+NAME = "ch06_dataset_scaling"
+
+# =========================================================================== #
+# 1. 公共导入 / 数据加载 / 脚手架（两版都给，不挖空）                          #
+# =========================================================================== #
+
+IMPORTS = '''from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+
+DATA = Path("data")          # notebook 的 cwd = coding/05_timeseries
+CSV = DATA / "load_curve.csv"
+PV_CSV = DATA / "pv_power.csv"
+
+torch.set_num_threads(4)     # 固定线程数：结果可复现的前提之一
+
+pd.set_option("display.width", 170)
+pd.set_option("display.max_columns", 40)
+np.set_printoptions(precision=4, suppress=True)
+
+print("torch", torch.__version__, "| sklearn 已就绪 | numpy", np.__version__)
+'''
+
+SETUP = '''WINDOW, HORIZON = 72, 24     # 输入窗口 3 天，预测未来 1 天
+SEED = 0
+
+raw = pd.read_csv(CSV, encoding="utf-8-sig", parse_dates=["时间戳"])
+df = raw.drop_duplicates().sort_values("时间戳").reset_index(drop=True)
+pv = pd.read_csv(PV_CSV, encoding="utf-8-sig", parse_dates=["时间戳"])
+pv = pv.drop_duplicates().sort_values("时间戳").reset_index(drop=True)
+
+print("负荷表：原始 %d 行 → 去重后 %d 行 | 台区 %s"
+      % (len(raw), len(df), sorted(df["台区编号"].unique())))
+print("光伏表：原始 %d 行 → 去重后 %d 行 | 电站 %s"
+      % (len(pd.read_csv(PV_CSV, encoding="utf-8-sig")), len(pv),
+         sorted(pv["电站编号"].unique())))
+print("光伏列", list(pv.columns))
+'''
+
+PLOT_SETUP = '''import matplotlib
+import matplotlib.pyplot as plt
+
+# macOS 上 matplotlib 默认字体不含中文，不设置的话图上全是方块
+plt.rcParams["font.sans-serif"] = ["PingFang SC", "Heiti SC", "Arial Unicode MS", "STHeiti"]
+plt.rcParams["axes.unicode_minus"] = False
+print("matplotlib", matplotlib.__version__, "| 中文字体 PingFang SC")
+'''
+
+SCAFFOLD = '''# 脚手架：下面的工具函数两版都有，你只填 @@todo 块里的内容
+
+
+def clean_series(s):
+    """按**小时分组**的中位数做 3 倍阈值判异常，再线性插值（与 ch01 / ch05 同一口径）。"""
+    med = s.groupby(s.index.hour).transform("median")
+    return s.where(s.between(0, 3 * med)).interpolate()
+
+
+def make_xy(arr, sel):
+    """把一条序列按给定的起点集合切成 (输入窗口, 未来目标) 两块。
+
+    返回的是 float32 numpy 数组：X 形状 (n, WINDOW)、y 形状 (n, HORIZON)。
+    这里刻意**只吃一条序列** —— 想混两条序列，得自己先拼，拼错就是 §6.1.1 的坑。
+    """
+    x = np.stack([arr[i: i + WINDOW] for i in sel]).astype(np.float32)
+    y = np.stack([arr[i + WINDOW: i + WINDOW + HORIZON] for i in sel]).astype(np.float32)
+    return x, y
+
+
+def ridge_mae(Xtr, Ytr, Xte, Yte, alpha=1.0):
+    """多输出 Ridge + MAE。
+
+    ⚠️ 这里 X 的标准化参数**只用训练段**拟合 —— 这就是本章 §6.3 的正确做法本身。
+    """
+    mu, sd = float(Xtr.mean()), float(Xtr.std())
+    model = Ridge(alpha=alpha).fit((Xtr - mu) / sd, Ytr)
+    return float(mean_absolute_error(Yte.ravel(), model.predict((Xte - mu) / sd).ravel()))
+'''
+
+# =========================================================================== #
+# 2. 任务代码块                                                              #
+# =========================================================================== #
+
+T1_CODE = '''def series_of(name):
+    """从一个台区名取清洗后的负荷序列（8760 点，无缺失）。"""
+    fr = df[df["台区编号"] == name].set_index("时间戳").sort_index()
+    return clean_series(fr["负荷值"].asfreq("h")).values.astype(np.float64)
+
+
+# @@todo 取出 A / B 两条清洗后的负荷序列
+# @@hint 用上面写好的 series_of(name)：台区名是 "STATION_A_01" / "STATION_B_02"
+S_A, S_B = series_of("STATION_A_01"), series_of("STATION_B_02")
+# @@end
+
+pv_fr = pv.set_index("时间戳").sort_index()
+
+# @@todo 光伏的**多特征**矩阵 (8760, 3)：实际功率 / 理论功率 / 辐照度
+# @@hint 实际功率有夜间零点漂移造成的负值 → 先 .clip(lower=0) 再 .interpolate() 补缺失
+# @@hint 另外两列直接 .asfreq("h").interpolate()；最后 np.stack([...], axis=1)
+act = pv_fr["实际功率"].asfreq("h").clip(lower=0).interpolate()
+PV3 = np.stack([act.values,
+                pv_fr["理论功率"].asfreq("h").interpolate().values,
+                pv_fr["辐照度"].asfreq("h").interpolate().values], axis=1).astype(np.float32)
+# @@end
+
+print("形状：S_A %s | S_B %s | PV3 %s（T 个时刻 × F 个特征）"
+      % (S_A.shape, S_B.shape, PV3.shape))
+print("A / B / PV实际功率 三条序列的尺度对照：")
+print("  均值   %9.4f %9.4f %9.4f" % (S_A.mean(), S_B.mean(), PV3[:, 0].mean()))
+print("  标准差 %9.4f %9.4f %9.4f  ← 相差 %.2f 倍"
+      % (S_A.std(), S_B.std(), PV3[:, 0].std(), S_B.std() / S_A.std()))
+print("PV 实际功率：清洗前 min %.2f（负值）→ 清洗后 min %.2f | max %.2f"
+      % (pv_fr["实际功率"].min(), act.min(), act.max()))
+
+# ---- 验收 ----
+assert S_A.shape == (8760,) and S_B.shape == (8760,) and PV3.shape == (8760, 3)
+assert abs(S_A.mean() - 460.201858) < 1e-4
+assert abs(S_B.mean() - 473.850483) < 1e-4, "B 是工业型，均值与 A 接近但波动大得多"
+assert abs(S_B.std() / S_A.std() - 3.895) < 1e-3, "B 的标准差是 A 的 3.9 倍"
+assert float(PV3[:, 0].min()) == 0.0, "负值必须先 clip 掉"
+'''
+
+T2_CODE = '''class WindowDataset(torch.utils.data.Dataset):
+    """滑窗数据集：**每条序列各自独立切窗**，窗口绝不跨越两条序列的边界。
+
+    series_list 里每个元素是一条序列：
+      - 1-D (T,)   → 单变量（负荷），内部会 reshape 成 (T, 1)
+      - 2-D (T, F) → 多特征（光伏：实际功率 / 理论功率 / 辐照度）
+    统一成 (T, F) 之后，`__getitem__` 返回的 x 永远是 (window, F)、y 永远是 (horizon,)，
+    **形状不带"是不是多变量"的分支** —— 下游模型只认 F 这一个数字。
+    target_col 指定哪一列是预测目标。
+    """
+
+    def __init__(self, series_list, window, horizon, stride=1, target_col=0):
+        self.window = window
+        self.horizon = horizon
+        self.target_col = target_col
+        self.series = [np.asarray(a, dtype=np.float32).reshape(len(a), -1) for a in series_list]
+        ends = [max(a.shape[0] - window - horizon + 1, 0) for a in self.series]
+        # @@todo 把「第几条序列 + 起点」展开成一维索引表 —— 每条序列各自独立切窗
+        # @@hint 双层列表推导，**必须压成一行**：推导的续行不能以 for 开头（挖空工具会拦下）
+        # @@hint [(k, i) for k, n in enumerate(ends) for i in range(0, n, stride)]
+        self.index = [(k, i) for k, n in enumerate(ends) for i in range(0, n, stride)]
+        # @@end
+
+    def __len__(self):
+        # @@todo 返回样本总数
+        return len(self.index)
+        # @@end
+
+    def __getitem__(self, j):
+        # @@todo 取出第 j 个样本的 (输入窗口, 未来 horizon 步目标)
+        # @@hint k, i = self.index[j]；arr = self.series[k]
+        # @@hint x = arr[i : i+window]；y = arr[i+window : i+window+horizon, target_col]
+        # @@hint 返回 torch.from_numpy(x), torch.from_numpy(y)
+        k, i = self.index[j]
+        arr = self.series[k]
+        x = arr[i: i + self.window]
+        y = arr[i + self.window: i + self.window + self.horizon, self.target_col]
+        return torch.from_numpy(x), torch.from_numpy(y)
+        # @@end
+
+
+ds_ab = WindowDataset([S_A, S_B], WINDOW, HORIZON)
+x0, y0 = ds_ab[0]
+each = len(S_A) - WINDOW - HORIZON + 1
+print("单条序列切出 %d 个样本；两条序列分组构造 → %d 个" % (each, len(ds_ab)))
+print("第 0 个样本：x %s | y %s   ← 单变量时 F=1" % (tuple(x0.shape), tuple(y0.shape)))
+print("索引表前 2 项 %s | 最后 2 项 %s" % (ds_ab.index[:2], ds_ab.index[-2:]))
+
+ds_stride = WindowDataset([S_A, S_B], WINDOW, HORIZON, stride=4)
+print("stride=4 → %d 个样本（%.1f%%）" % (len(ds_stride), 100 * len(ds_stride) / len(ds_ab)))
+
+# ---- 验收 ----
+assert len(ds_ab) == 17330, "两条序列各自切 8665 个，合计 17330"
+assert tuple(x0.shape) == (72, 1) and tuple(y0.shape) == (24,)
+assert ds_ab.index[0] == (0, 0) and ds_ab.index[-1] == (1, each - 1)
+assert len(ds_stride) == 4334, "stride=4 → 每条 2167 个"
+assert isinstance(x0, torch.Tensor)
+'''
+
+T3_CODE = '''concat = np.concatenate([S_A, S_B])
+CUT = len(S_A)                       # 8760：A 与 B 的接缝位置
+
+# @@todo 错误示范：把 A / B 首尾接成一条长序列再切窗（列表里只放**一条**序列）
+# @@hint WindowDataset([concat], WINDOW, HORIZON)
+ds_bad = WindowDataset([concat], WINDOW, HORIZON)
+# @@end
+
+# @@todo 正确写法：两条序列分开传（列表里放**两条**）
+# @@hint WindowDataset([S_A, S_B], WINDOW, HORIZON)
+ds_ok = WindowDataset([S_A, S_B], WINDOW, HORIZON)
+# @@end
+
+starts = np.array([i for _, i in ds_bad.index])
+cross = starts[(starts < CUT) & (starts + WINDOW + HORIZON > CUT)]
+xcross = starts[(starts < CUT) & (starts + WINDOW > CUT)]
+ycross = starts[(starts + WINDOW <= CUT) & (starts + WINDOW + HORIZON > CUT)]
+
+print("concat 构造 %d 个样本 | 分组构造 %d 个样本 | 多出来 %d 个"
+      % (len(ds_bad), len(ds_ok), len(ds_bad) - len(ds_ok)))
+print("跨界样本 %d 个（起点 %d ~ %d）" % (len(cross), cross.min(), cross.max()))
+print("  其中「输入窗口跨边界」%d 个 | 「目标跨边界」%d 个" % (len(xcross), len(ycross)))
+print("接缝两侧：A 的最后一小时（2025-12-31 23:00）负荷 %.2f" % S_A[-1])
+print("          B 的第一小时（2025-01-01 00:00）负荷 %.2f  ← 时间倒退了 364 天" % S_B[0])
+
+# ---- 验收 ----
+assert len(ds_bad) == 17425 and len(ds_ok) == 17330
+assert len(cross) == 95 and len(xcross) == 71 and len(ycross) == 24
+assert CUT == 8760
+'''
+
+T4_CODE = '''SEL_B = np.arange(len(S_B) - WINDOW - HORIZON + 1)
+Xb_tr, Yb_tr = make_xy(S_B, SEL_B[:int(0.8 * len(S_B)) - WINDOW - HORIZON + 1])
+Xb_te, Yb_te = make_xy(S_B, SEL_B[int(0.8 * len(S_B)):])
+
+# @@todo 用「只有 B 干净窗口」的训练集，在 B 测试段上算 MAE —— 这是本节的及格线
+# @@hint 脚手架里已有 ridge_mae(Xtr, Ytr, Xte, Yte)
+mae_clean = ridge_mae(Xb_tr, Yb_tr, Xb_te, Yb_te)
+# @@end
+
+# @@todo 同一个模型，改在 95 个「跨界样本」上评估 —— 输入/目标都是拼出来的假数据
+# @@hint 跨界样本的起点就是 cross；用 make_xy(concat, cross) 取出来
+Xg, Yg = make_xy(concat, cross)
+mae_cross = ridge_mae(Xb_tr, Yb_tr, Xg, Yg)
+# @@end
+
+# @@todo 最后：把这 95 个跨界样本混进 B 的训练集，看 B 测试段 MAE 变了多少
+# @@hint 训练集换成 np.concatenate([Xb_tr, Xg]) / np.concatenate([Yb_tr, Yg])
+mae_mix = ridge_mae(np.concatenate([Xb_tr, Xg]), np.concatenate([Yb_tr, Yg]), Xb_te, Yb_te)
+# @@end
+
+jump_t = [float(np.abs(np.diff(concat[i + WINDOW: i + WINDOW + HORIZON])).max()) for i in cross]
+print("B 测试段 MAE（只用 B 的干净窗口训练）  %.6f" % mae_clean)
+print("同一个模型在 95 个跨界样本上         %.6f（是前者的 %.1f 倍）"
+      % (mae_cross, mae_cross / mae_clean))
+print("混进 95 个跨界样本后 B 测试段        %.6f（%+.6f）"
+      % (mae_mix, mae_mix - mae_clean))
+print("跨界样本「目标内部」最大单步跳变 %.2f kW" % max(jump_t))
+print("对照：B 全年最大单步跳变 %.2f kW | A 全年最大单步跳变 %.2f kW"
+      % (np.abs(np.diff(S_B)).max(), np.abs(np.diff(S_A)).max()))
+
+# ---- 验收 ----
+assert abs(mae_clean - 63.174770) < 1e-4, f"B 测试段干净 MAE 实际是 {mae_clean}"
+assert abs(mae_cross - 165.186264) < 1e-4, f"跨界样本 MAE 实际是 {mae_cross}"
+assert mae_cross > 2 * mae_clean
+assert abs(mae_mix - 63.208420) < 1e-4
+assert abs(max(jump_t) - 349.35) < 1e-2, "跨界样本制造了全年最大的单步跳变"
+'''
+
+T5_CODE = '''ds_pv = WindowDataset([PV3], WINDOW, HORIZON)
+print("光伏样本数 %d | 特征数 F=%d | 单个样本 x %s"
+      % (len(ds_pv), PV3.shape[1], tuple(ds_pv[0][0].shape)))
+
+with torch.random.fork_rng():
+    torch.manual_seed(SEED)
+    # @@todo 建 DataLoader：batch=8、训练集内允许 shuffle、drop_last 丢掉最后那个不满的 batch
+    # @@hint torch.utils.data.DataLoader(ds_pv, batch_size=8, shuffle=True, drop_last=True)
+    dl = torch.utils.data.DataLoader(ds_pv, batch_size=8, shuffle=True, drop_last=True)
+    # @@end
+
+    # @@todo 取出一个 batch，拿到两个张量
+    # @@hint next(iter(dl)) → (xb, yb)
+    xb, yb = next(iter(dl))
+    # @@end
+
+idx_ds = torch.utils.data.TensorDataset(torch.arange(20))
+dl_seq = torch.utils.data.DataLoader(idx_ds, batch_size=8)
+order_seq = [int(v) for v in next(iter(dl_seq))[0]]        # shuffle=False：一定是 0..7
+
+with torch.random.fork_rng():
+    torch.manual_seed(SEED)
+    # @@todo 换成 shuffle=True 的 DataLoader，取出第一个 batch 的样本下标
+    # @@hint DataLoader(idx_ds, batch_size=8, shuffle=True)；[int(v) for v in next(iter(dl))[0]]
+    dl_shuf = torch.utils.data.DataLoader(idx_ds, batch_size=8, shuffle=True)
+    order_shuf = [int(v) for v in next(iter(dl_shuf))[0]]
+    # @@end
+
+print("一个 batch：x %s | y %s   ← (B, window, F) 与 (B, horizon)"
+      % (tuple(xb.shape), tuple(yb.shape)))
+print("%d 个样本 / batch=8 / drop_last=True → %d 个 batch（丢掉 %d 个）"
+      % (len(ds_pv), len(dl), len(ds_pv) - len(dl) * 8))
+print("shuffle=False 的第一个 batch 下标:", order_seq)
+print("shuffle=True  的第一个 batch 下标:", order_shuf, "← 打乱了，但固定种子下可复现")
+
+# ---- 验收 ----
+assert len(ds_pv) == 8665 and len(dl) == 1083
+assert tuple(xb.shape) == (8, 72, 3) and tuple(yb.shape) == (8, 24)
+assert order_seq == list(range(8))
+assert sorted(order_shuf) != order_seq, "shuffle=True 必须真的打乱了顺序"
+assert len(set(order_shuf)) == 8
+'''
+
+T6_CODE = '''def fit_zscore(x):
+    # @@todo 返回 (均值, 标准差) —— 只用传进来的这一段（训练段）拟合
+    # @@hint float(np.mean(x)) / float(np.std(x))；注意 np.std 默认 ddof=0，与 sklearn 一致
+    return float(np.mean(x)), float(np.std(x))
+    # @@end
+
+
+def apply_zscore(x, mu, sd):
+    # @@todo 用 (x - mu) / sd 做标准化
+    return (x - mu) / sd
+    # @@end
+
+
+def fit_minmax(x):
+    # @@todo 返回 (最小值, 最大值)
+    return float(x.min()), float(x.max())
+    # @@end
+
+
+def apply_minmax(x, lo, hi):
+    # @@todo 线性映射到 [0, 1]
+    return (x - lo) / (hi - lo)
+    # @@end
+
+
+probe = np.array([[1.0], [2.0], [3.0]])
+z_hand = apply_zscore(probe, *fit_zscore(probe))
+m_hand = apply_minmax(probe, *fit_minmax(probe))
+print("手写 z-score →", z_hand.ravel(), "| sklearn StandardScaler →",
+      StandardScaler().fit_transform(probe).ravel())
+print("手写 min-max →", m_hand.ravel(), "| sklearn MinMaxScaler   →",
+      MinMaxScaler().fit_transform(probe).ravel())
+
+# ---- 验收 ----
+assert np.allclose(z_hand, StandardScaler().fit_transform(probe))
+assert np.allclose(m_hand, MinMaxScaler().fit_transform(probe))
+assert np.allclose(m_hand.ravel(), [0.0, 0.5, 1.0])
+'''
+
+T7_CODE = '''SEL_A = np.arange(len(S_A) - WINDOW - HORIZON + 1)
+SPLIT_A = int(0.8 * len(S_A))
+Xa_tr, Ya_tr = make_xy(S_A, SEL_A[:SPLIT_A - WINDOW - HORIZON + 1])
+Xa_te, Ya_te = make_xy(S_A, SEL_A[SPLIT_A:])
+Xa_all = np.concatenate([Xa_tr, Xa_te])
+print("A 台区：训练 %d 个窗口 / 测试 %d 个窗口" % (len(Xa_tr), len(Xa_te)))
+
+# @@todo z-score ① 缩放参数**只用训练段**拟合
+# @@hint mu_tr, sd_tr = fit_zscore(Xa_tr)
+# @@hint Ridge(alpha=1.0).fit(apply_zscore(Xa_tr, mu_tr, sd_tr), Ya_tr)
+# @@hint MAE 用 mean_absolute_error(Ya_te.ravel(), pred.ravel()) —— 目标在 kW 尺度上，
+# @@hint 所以只对 X 做缩放、y 不动，误差就自然是 kW
+mu_tr, sd_tr = fit_zscore(Xa_tr)
+mae_z_tr = float(mean_absolute_error(
+    Ya_te.ravel(),
+    Ridge(alpha=1.0).fit(apply_zscore(Xa_tr, mu_tr, sd_tr), Ya_tr)
+    .predict(apply_zscore(Xa_te, mu_tr, sd_tr)).ravel()))
+# @@end
+
+# @@todo z-score ② 换成**全量**拟合的 (均值, 标准差)，其余完全不动
+# @@hint mu_all, sd_all = fit_zscore(Xa_all)
+mu_all, sd_all = fit_zscore(Xa_all)
+mae_z_all = float(mean_absolute_error(
+    Ya_te.ravel(),
+    Ridge(alpha=1.0).fit(apply_zscore(Xa_tr, mu_all, sd_all), Ya_tr)
+    .predict(apply_zscore(Xa_te, mu_all, sd_all)).ravel()))
+# @@end
+
+print("z-score：训练段拟合 %.6f | 全量拟合 %.6f | 差 %+.8f"
+      % (mae_z_tr, mae_z_all, mae_z_all - mae_z_tr))
+print("训练段 mean/std %.6f / %.6f | 全量 mean/std %.6f / %.6f"
+      % (mu_tr, sd_tr, mu_all, sd_all))
+print("测试段 mean %.6f（比训练段高 %.2f%%）"
+      % (S_A[SPLIT_A:].mean(), 100 * (S_A[SPLIT_A:].mean() / S_A[:SPLIT_A].mean() - 1)))
+
+# ---- 验收 ----
+assert abs(mae_z_tr - 17.480038) < 1e-5, f"训练段拟合 MAE 实际是 {mae_z_tr}"
+assert abs(mae_z_all - 17.480042) < 1e-5
+assert abs(mae_z_all - mae_z_tr) < 1e-4, "这是负结果：全量拟合在本数据上几乎没影响"
+'''
+
+T8_CODE = '''# @@todo min-max ① 缩放参数**只用训练段**拟合
+# @@hint lo_tr, hi_tr = fit_minmax(Xa_tr)；Ridge 那一套与上面 z-score 完全一样
+lo_tr, hi_tr = fit_minmax(Xa_tr)
+mae_m_tr = float(mean_absolute_error(
+    Ya_te.ravel(),
+    Ridge(alpha=1.0).fit(apply_minmax(Xa_tr, lo_tr, hi_tr), Ya_tr)
+    .predict(apply_minmax(Xa_te, lo_tr, hi_tr)).ravel()))
+# @@end
+
+# @@todo min-max ② 换成**全量**拟合的 (最小值, 最大值)
+# @@hint lo_all, hi_all = fit_minmax(Xa_all)
+lo_all, hi_all = fit_minmax(Xa_all)
+mae_m_all = float(mean_absolute_error(
+    Ya_te.ravel(),
+    Ridge(alpha=1.0).fit(apply_minmax(Xa_tr, lo_all, hi_all), Ya_tr)
+    .predict(apply_minmax(Xa_te, lo_all, hi_all)).ravel()))
+# @@end
+
+print("min-max：训练段拟合 %.6f | 全量拟合 %.6f | 差 %+.8f"
+      % (mae_m_tr, mae_m_all, mae_m_all - mae_m_tr))
+print("训练段 min/max %.4f / %.4f | 全量 min/max %.4f / %.4f"
+      % (lo_tr, hi_tr, lo_all, hi_all))
+print("训练段与全量的极值一模一样？%s  ← min-max 的参数完全没变，MAE 自然一分不差"
+      % ((lo_tr, hi_tr) == (lo_all, hi_all)))
+print("四宫格（kW）：z-score 训练段 %.6f / 全量 %.6f | min-max 训练段 %.6f / 全量 %.6f"
+      % (mae_z_tr, mae_z_all, mae_m_tr, mae_m_all))
+
+# ---- 验收 ----
+assert abs(mae_m_tr - 17.464098) < 1e-5, f"min-max 训练段拟合 MAE 实际是 {mae_m_tr}"
+assert (lo_tr, hi_tr) == (lo_all, hi_all), "A 台区的极值本来就落在训练段里"
+assert abs(mae_m_all - mae_m_tr) < 1e-12, "min-max 的负结果比 z-score 还彻底：一分不差"
+assert abs(mae_z_all - mae_z_tr) < 0.001
+'''
+
+T9_CODE = '''def ts_split(n, n_splits, gap=0):
+    """手写 TimeSeriesSplit：返回 [(train_idx, valid_idx), ...]。
+
+    第 k 折的**验证段**起点固定在 k * fold（与 sklearn 一致），
+    训练段则从 0 开始一直铺到「验证段起点 - gap」。
+    """
+    fold = n // (n_splits + 1)
+    out = []
+    for k in range(1, n_splits + 1):
+        # @@todo 第 k 折：验证段起点固定在 k*fold，训练段末端往后退 gap 个点
+        # @@hint va_lo = k * fold；训练段是 [0, va_lo - gap)
+        # @@hint 最后一折的验证段要一直吃到序列末尾（把 n % (n_splits+1) 的余数一起吃掉）
+        va_lo = k * fold
+        tr_end = va_lo - gap
+        va_hi = n if k == n_splits else va_lo + fold
+        out.append((np.arange(max(tr_end, 0)), np.arange(va_lo, va_hi)))
+        # @@end
+    return out
+
+
+folds_0 = ts_split(8760, 4, 0)
+print("每折的 fold 长度 = 8760 // 5 = %d（8760 / 5 正好整除）" % (8760 // 5))
+for k, (tr, va) in enumerate(ts_split(8760, 4, 0), start=1):
+    print("  第 %d 折：训练 [0, %4d) 共 %4d | 验证 [%4d, %4d) 共 %d"
+          % (k, tr[-1] + 1, len(tr), va[0], va[-1] + 1, len(va)))
+
+# ---- 验收 ----
+assert len(folds_0) == 4
+assert [len(tr) for tr, _ in folds_0] == [1752, 3504, 5256, 7008]
+assert [len(va) for _, va in folds_0] == [1752, 1752, 1752, 1752]
+assert [int(tr[-1]) + 1 for tr, _ in folds_0] == [1752, 3504, 5256, 7008]
+assert [int(va[0]) for _, va in folds_0] == [1752, 3504, 5256, 7008]
+'''
+
+T10_CODE = '''n = 8760
+checks = {}
+for g in (0, 24, 48):
+    # @@todo 把手写版与 sklearn 版逐折对账（训练段与验证段的起止都要一致）
+    # @@hint list(TimeSeriesSplit(n_splits=4, gap=g).split(np.arange(n))) → [(train_idx, valid_idx), ...]
+    # @@hint 用 np.array_equal 逐个比
+    mine, skl = ts_split(n, 4, g), list(TimeSeriesSplit(n_splits=4, gap=g).split(np.arange(n)))
+    same_tr = [np.array_equal(a, b) for (a, _), (b, _) in zip(mine, skl)]
+    same_va = [np.array_equal(c, d) for (_, c), (_, d) in zip(mine, skl)]
+    checks[g] = all(same_tr) and all(same_va)
+    # @@end
+
+# @@todo 打出 gap=0 与 gap=24 两种切法的折边界，看清 gap 到底削掉了什么
+# @@hint 每折打印 (训练段右开边界, 验证段起点, 验证段右开边界)
+# @@hint 右开边界 = int(idx[-1]) + 1
+edges0 = [(int(a[-1]) + 1, int(c[0]), int(c[-1]) + 1) for a, c in ts_split(n, 4, 0)]
+edges24 = [(int(a[-1]) + 1, int(c[0]), int(c[-1]) + 1) for a, c in ts_split(n, 4, 24)]
+# @@end
+
+print("手写 vs sklearn 对账：", {g: ("一致" if ok else "不一致") for g, ok in checks.items()})
+print("gap=0  折边界 (train_end, valid_lo, valid_hi):", edges0)
+print("gap=24 折边界 (train_end, valid_lo, valid_hi):", edges24)
+print("对比第 1 折：训练段末端 %d → %d（少喂 %d 个点），验证段起点 %d 没变"
+      % (edges0[0][0], edges24[0][0], edges0[0][0] - edges24[0][0], edges0[0][1]))
+
+# ---- 验收 ----
+assert all(checks.values()), "手写实现必须与 sklearn 逐折一致"
+assert edges24[0][0] == 1728 and edges24[0][1] == 1752 and edges24[0][2] == 3504
+assert edges0 == [(1752, 1752, 3504), (3504, 3504, 5256), (5256, 5256, 7008), (7008, 7008, 8760)]
+assert [a - b for (a, _, _), (b, _, _) in zip(edges0, edges24)] == [24, 24, 24, 24]
+'''
+
+T11_CODE = '''FOLDS = ts_split(len(S_A), 4, 0)
+NMAX = len(S_A) - WINDOW - HORIZON + 1
+SLIDE_LEN = 1752
+fold_mae = {"expanding": [], "sliding": []}
+
+for name in ("expanding", "sliding"):
+    for tr, va in FOLDS:
+        tr_end = int(tr[-1]) + 1
+        v_lo, v_hi = int(va[0]), min(int(va[-1]) + 1, NMAX)
+        Xv, Yv = make_xy(S_A, np.arange(v_lo, v_hi))
+        # @@todo 按两种口径划出训练样本下标，训练 Ridge 并在验证段上算 MAE
+        # @@hint 扩展窗：训练段永远从 0 开始（数据越攒越多）→ lo_i = 0
+        # @@hint 滑窗：训练段长度恒为 SLIDE_LEN → lo_i = max(0, tr_end - SLIDE_LEN)
+        # @@hint 训练段右端 = min(tr_end - WINDOW - HORIZON + 1, NMAX)（凑不满的窗口要切掉）
+        lo_i = 0 if name == "expanding" else max(0, tr_end - SLIDE_LEN)
+        hi_i = min(tr_end - WINDOW - HORIZON + 1, NMAX)
+        Xt, Yt = make_xy(S_A, np.arange(lo_i, hi_i))
+        fold_mae[name].append((hi_i - lo_i, ridge_mae(Xt, Yt, Xv, Yv)))
+        # @@end
+    sizes = [c for c, _ in fold_mae[name]]
+    maes = [round(m, 4) for _, m in fold_mae[name]]
+    print("%-9s 训练样本数 %s | 各折 MAE %s | 折均 %.6f"
+          % (name, sizes, maes, sum(m for _, m in fold_mae[name]) / len(fold_mae[name])))
+
+exp_mean = sum(m for _, m in fold_mae["expanding"]) / 4
+sld_mean = sum(m for _, m in fold_mae["sliding"]) / 4
+print("折均 MAE：扩展窗 %.6f vs 滑窗 %.6f（差 %+.6f）" % (exp_mean, sld_mean, sld_mean - exp_mean))
+
+# ---- 验收 ----
+assert [c for c, _ in fold_mae["expanding"]] == [1657, 3409, 5161, 6913]
+assert [c for c, _ in fold_mae["sliding"]] == [1657, 1657, 1657, 1657]
+assert abs(fold_mae["expanding"][2][1] - 16.926867) < 1e-4
+assert abs(sld_mean - exp_mean - 0.741726) < 1e-3, "扩展窗 4 折平均更好"
+'''
+
+T12_CODE = '''fig, axes = plt.subplots(1, 2, figsize=(12.4, 4.2))
+
+# ---- 左图：TimeSeriesSplit 4 折 + gap=24 的示意 ----
+for k, (tr, va) in enumerate(ts_split(len(S_A), 4, 24), start=1):
+    axes[0].barh(k, len(tr), left=0, height=0.55, color="tab:blue", alpha=0.85)
+    axes[0].barh(k, 24, left=len(tr), height=0.55, color="crimson", alpha=0.6)
+    axes[0].barh(k, len(va), left=int(va[0]), height=0.55, color="tab:orange", alpha=0.85)
+axes[0].plot([], [], "s", color="tab:blue", label="训练段")
+axes[0].plot([], [], "s", color="crimson", alpha=0.6, label="gap=24")
+axes[0].plot([], [], "s", color="tab:orange", label="验证段")
+axes[0].set_xlabel("时间（小时）")
+axes[0].set_ylabel("第 k 折")
+axes[0].set_yticks([1, 2, 3, 4])
+axes[0].set_title("TimeSeriesSplit(4, gap=24)：验证段位置固定，训练段整体后退 gap")
+axes[0].legend(fontsize=9, loc="lower right")
+
+# @@todo 右图：扩展窗 vs 滑窗的训练样本数与折 MAE 对照
+# @@hint 两条折线，横轴是折号 1..4；一条画训练样本数（左轴），一条画折 MAE
+# @@hint 这里只画 MAE：axes[1].plot(...)
+exp_mae = [m for _, m in fold_mae["expanding"]]
+sld_mae = [m for _, m in fold_mae["sliding"]]
+exp_n = [c for c, _ in fold_mae["expanding"]]
+sld_n = [c for c, _ in fold_mae["sliding"]]
+axes[1].plot(np.arange(1, 5), exp_mae, "-o", label="扩展窗 expanding（样本 1657→6913）")
+axes[1].plot(np.arange(1, 5), sld_mae, "--s", label="滑窗 sliding（样本恒为 1657）")
+# @@end
+
+axes[1].axhline(exp_mean, ls=":", color="tab:blue", lw=1)
+axes[1].axhline(sld_mean, ls=":", color="tab:orange", lw=1)
+axes[1].set_xlabel("第 k 折")
+axes[1].set_ylabel("验证折 MAE（kW）")
+axes[1].set_xticks([1, 2, 3, 4])
+axes[1].set_title("滑窗 vs 扩展窗：4 折 MAE（折均 %.4f vs %.4f）" % (exp_mean, sld_mean))
+axes[1].legend(fontsize=9)
+plt.tight_layout()
+
+print("左图：4 折 + gap=24 的区间示意；右图：滑窗 vs 扩展窗的折 MAE")
+print("注意第 1 折两条线重合（数据量都是 1657）—— 差异从第 2 折开始")
+
+# ---- 验收 ----
+assert len(exp_mae) == 4 and abs(exp_mae[0] - sld_mae[0]) < 1e-12, "第 1 折两者必然相同"
+assert exp_mae[1] < sld_mae[1], "第 2 折起扩展窗数据更多，MAE 更低"
+'''
+
+# =========================================================================== #
+# 3. 讲解版（LESSON）                                                        #
+# =========================================================================== #
+
+LESSON = [
+    md(
+        """
+# ch06 数据构造与标准化（讲解版）
+
+> **本节考点**：把「一条长序列」变成「能喂进 `DataLoader` 的监督数据集」，
+> 以及在**不泄漏**的前提下把数据缩放到模型能吃的尺度。竞赛评分点对应
+> **数据准备及处理 10%**（分值不高，但错了会把 40% 的模型训练一起毁掉）。
+
+| 竞赛评分点 | 分值含义 | 本章覆盖 |
+|---|---|---|
+| 数据准备及处理 | 技能操作 10% | 滑窗 `Dataset`、`DataLoader`、防泄漏缩放 |
+| 模型训练 | **技能操作 40%** | 数据集构造错了，模型再好也白搭；跨界窗口 = 喂假样本 |
+| 模型调参 | 技能操作 10% | `window` / `horizon` / `stride` 就是时序模型最重要的三个「超参」 |
+| 模型性能评估 | 技能操作 10% | 缩放口径不一致会让指标不可比 |
+
+**与相邻章节的分工**：
+
+| 章节 | 管什么 | 本章的边界 |
+|---|---|---|
+| `ch01` | 特征工程与三种泄漏（第三种是**负结果**，本章把它做透） | 本章只做「缩放」这一种泄漏的量化 |
+| `ch05` | 多步的三种范式（递归 / 直接 / Seq2Seq） | 本章提供它们共用的数据管道 |
+| **`ch06`（本章）** | **滑窗 Dataset + 防泄漏缩放 + TimeSeriesSplit** | — |
+| `ch07` | 评估指标（MAPE 零点陷阱）与可视化规范 | 本章只用 MAE 做口径比较 |
+| `ch08` | 基线模型与超参搜索 | 本章的 `window` / `stride` 是超参候选 |
+
+## 学习目标
+
+1. 手写一个带 `window` / `horizon` / `stride` 的 `WindowDataset`，并支持多特征 `(T, F)`
+2. **说出「窗口跨越实体边界」为什么是泄漏**，并会数出有多少个跨界样本
+3. 会用 `DataLoader`，说清 `(B, window, F)` → `(B, horizon)` 的形状，
+   以及 `shuffle=True` 在时序上的**合法边界**
+4. 手写 z-score / min-max 的 `fit` / `apply`，并**量化**「训练段拟合 vs 全量拟合」的差别
+5. 手写 `TimeSeriesSplit` 并与 sklearn **逐折对账**，说清 `gap` 参数的作用
+6. 说清「滑窗 vs 扩展窗」的取舍，并用 4 折 MAE 实测
+
+## API 速查表
+
+| 方法 / 属性 | 关键参数 | 返回 | 一句话 |
+|---|---|---|---|
+| `torch.utils.data.Dataset` | 需实现 `__len__` / `__getitem__` | 抽象类 | 自定义数据集只要求这两个魔法方法 |
+| `Dataset.__getitem__(i)` | 下标 | 任意（这里是两个 `Tensor`） | **只负责取一个样本**，不做批处理 |
+| `torch.utils.data.DataLoader` | `batch_size` / `shuffle` / `drop_last` | 可迭代对象 | 负责组 batch；`shuffle` 只影响**迭代顺序** |
+| `TensorDataset` | 若干等长张量 | `Dataset` | 把现成张量打包成数据集，用来演示 `shuffle` 很方便 |
+| `torch.random.fork_rng()` | — | 上下文管理器 | 局部换种子，出了块自动还原 |
+| `np.stack([...])` | `axis` | `ndarray` | 把 n 个同形状数组叠成 (n, ...)，滑窗构造的主力 |
+| `MinMaxScaler().fit_transform(X)` | — | `ndarray` | `(x - min) / (max - min)`，对**极值**敏感 |
+| `StandardScaler().fit_transform(X)` | — | `ndarray` | `(x - μ) / σ`，`np.std` 默认 `ddof=0` 与它一致 |
+| `TimeSeriesSplit(n_splits, gap)` | `gap` | `splitter` | `gap` = 训练段末端往后退几个点，避免与验证段相邻 |
+| `Ridge(alpha).fit(X, y)` | `alpha` | `estimator` | 多输出回归：`y` 给 `(n, 24)` 就吐 24 维 |
+| `mean_absolute_error(y, p)` | — | `float` | 多输出要先 `.ravel()` 摊平，才是"整体 MAE" |
+
+## 本章的「真值锚点」
+
+| 常量 | 值 | 含义 |
+|---|---|---|
+| `WINDOW` / `HORIZON` | **72 / 24** | 与 ch05 完全一致（数据管道要能直接对接） |
+| `SEED` | **0** | 所有随机性都锚在它上面 |
+| A 台区（居民型） | 8760 点，均值 ≈ 460.20 | ch05 / ch06 的主序列 |
+| B 台区（工业型） | 8760 点，均值 ≈ 473.85、**标准差是 A 的 3.9 倍** | 跨界与尺度对照的靶子 |
+| 光伏 | 8760 × 3 特征 | 演示 `(B, window, F)` 的 F > 1 |
+"""
+    ),
+    code(IMPORTS),
+    code(SETUP),
+    code(PLOT_SETUP),
+    code(SCAFFOLD),
+    md(
+        """
+## 6.1 手写 `WindowDataset`：滑窗是最小可用的监督数据集
+
+时序预测的数据集只有一件事要做：**把一条长序列切成「过去 → 未来」的样本对**。
+
+```
+原序列  t0 t1 t2 … t71 t72 t73 … t95 t96 …
+样本 0  └───── 输入 (72) ─────┘└─ 目标 (24) ─┘
+样本 1     └───── 输入 ─────┘└─ 目标 ─┘
+样本 2        └───── 输入 ─────┘└─ 目标 ─┘
+```
+
+三个参数决定了数据集的一切：
+
+| 参数 | 作用 | 本章取值 | 调大的后果 |
+|---|---|---|---|
+| `window` | 输入看多长 | 72（3 天） | 参数变多、更吃数据；太长会引入无关历史 |
+| `horizon` | 预测多少步 | 24（1 天） | 目标维度变大，每维分到的监督变少 |
+| `stride` | 相邻样本隔多远 | 1 | stride=1 时相邻样本高度重叠（8665 个样本其实只覆盖 8760 个点） |
+
+**为什么要写 `Dataset` 而不是直接 `np.stack`**：
+
+1. **省内存**：`map-style` 数据集**按需**取样本。8 万个窗口 × 72 × 3 个 float32 = 69 MB，
+   一次性 `stack` 出来还好；但换成 15 分钟级、3 年的数据就直接爆内存了。
+2. **能配 `DataLoader`**：`shuffle` / `batch_size` / 多进程 / `collate_fn` 全都白送。
+3. **边界可查**：索引表 `self.index` 是「第几条序列 + 起点」，
+   想数出跨界样本只要看一眼这张表（下一节）。
+
+**多特征怎么进来**：`series_list` 里的元素可以是 `(T,)` 也可以是 `(T, F)`。
+`__init__` 会把它们**统一 reshape 成 `(T, F)`**（1-D → `(T, 1)`），
+所以 `__getitem__` 返回的永远是 `x (window, F)` / `y (horizon,)` ——
+**形状不带"是不是多变量"的分支**，下游模型只认 `F` 这一个数字。
+多特征时只取 `target_col` 那一列当目标，这就是**多变量输入、单变量输出**；`F=1` 时退化成单变量。
+"""
+    ),
+    code(T1_CODE),
+    code(T2_CODE),
+    md(
+        """
+### 6.1.1 难点深挖：窗口跨越两个台区，就是「实体泄漏」
+
+**为什么难**：把多个实体（台区 / 线路 / 站）的序列**首尾相接**成一条长序列，
+再统一切窗 —— 这是最自然、最省事的写法，`np.concatenate` 一行就完事，
+**它不报错、不警告，形状也完全正确**。
+
+**错误示范**：
+
+```python
+concat = np.concatenate([S_A, S_B])          # 17520 点
+ds_bad = WindowDataset([concat], 72, 24)     # 17425 个样本
+```
+
+**发生了什么**（实测）：
+
+| 量 | 值 |
+|---|---|
+| concat 切出的样本数 | **17425** |
+| 分组切出的样本数 | **17330** |
+| 多出来的**跨界样本** | **95** |
+| 其中「输入窗口跨边界」 | **71** 个（起点 8689 ~ 8759） |
+| 其中「目标跨边界」 | **24** 个（起点 8665 ~ 8688） |
+
+接缝两侧是什么？
+
+```
+A 的最后一小时   2025-12-31 23:00   负荷 497.96
+B 的第一小时     2025-01-01 00:00   负荷 148.61     ← 时间倒退了 364 天
+```
+
+所以跨界窗口里同时含有 **A 的年末**和 **B 的年初** —— 不只是"两个台区"，还是**两个不相邻的时间**。
+窗口长 96（72 输入 + 24 目标），所以只要起点落在 `[8665, 8759]`，样本就会跨过去。
+
+**它到底祸害了多少**（实测，同一套 `Ridge`）：
+
+| 评估对象 | MAE |
+|---|---|
+| B 测试段（**只用 B 的干净窗口**训练） | **63.174770** |
+| 同一个模型，改在 **95 个跨界样本**上评估 | **165.186264**（**2.6 倍**） |
+| 把这 95 个混进 B 的训练集后，B 测试段 | 63.208420（**+0.033649**） |
+
+第三行要**如实读**：混进去只让整体指标涨了 0.03 kW（95 / 17330 = **0.55%**），
+**在这份数据上几乎测不出来**。但前两行说明机制是真的：
+干净模型在跨界样本上的误差是正常水平的 2.6 倍，因为那些样本的输入和目标**本来就不是一段真实的历史**。
+
+还有一条更硬的证据 —— 跨界样本「目标内部」的最大单步跳变：
+
+| 数据 | 全年最大单步跳变 |
+|---|---|
+| A 台区 | 142.34 kW |
+| B 台区 | 303.38 kW |
+| **跨界样本的目标** | **349.35 kW** ← 全年没有哪一小时真这么跳 |
+
+**判定规则**：
+
+> **只要表里存在「多个实体」，切窗之前必须先按实体分组。**
+> • 判断方法（很土但有效）：**数一数分组前后的样本数**。
+>   两者相等 → 没跨界；差了几十个 → 有窗口在"偷"隔壁实体的数据。
+> • 这个坑在竞赛里会随实体数量**线性放大**：2 个台区只有 95 个假样本，
+>   200 条线路就是 200 × 95 量级 —— 那时 0.55% 会变成 55%。
+> • 它和 ch01 的「`shift` 不分组」是同一类错误：**时序算子默认不知道"实体"这回事**。
+>   `np.concatenate` 不知道、`shift` 不知道、`rolling` 也不知道。
+"""
+    ),
+    code(T3_CODE),
+    code(T4_CODE),
+    md(
+        """
+## 6.2 `DataLoader` 与形状：`(B, window, F)` 进，`(B, horizon)` 出
+
+`Dataset` 只负责「取一个样本」，`DataLoader` 负责「组一批样本」。形状约定要背下来：
+
+| 位置 | 形状 | 含义 |
+|---|---|---|
+| 单个样本 | `x (window, F)` / `y (horizon,)` | 单变量时 `F=1`，`x` 是 `(window, 1)` |
+| 一个 batch | `x (B, window, F)` / `y (B, horizon)` | `B` 是 batch 大小 |
+| 本章实测（光伏，F=3） | `x (8, 72, 3)` / `y (8, 24)` | 8665 个样本、batch=8、`drop_last=True` → **1083** 个 batch |
+
+**`drop_last` 为什么要开**：8665 / 8 = 1083.125，最后一个 batch 只有 1 个样本。
+如果模型里有 `BatchNorm` 或任何按 batch 统计的东西，最后这个"瘦"batch 会
+让统计量剧烈抖动。**训练集用 `drop_last=True`，验证集不要用**（否则会漏掉尾巴上的样本）。
+
+### 6.2.1 难点深挖：`shuffle=True` 在时序上到底安不安全
+
+**为什么难**：教科书一边说"时序不能 shuffle"（ch01 §1.4.1 的随机切分泄漏），
+一边所有教程的 `DataLoader` 都写着 `shuffle=True`。这两句话**都对**，
+但说的不是同一件事 —— 分不清就会踩坑。
+
+**关键区分**：`shuffle` 打乱的是**一个 epoch 内部的取样本顺序**，
+它**不改变**训练集 / 验证集 / 测试集的划分。
+
+```python
+# ❌ 切分打乱：测试集的时间点会跑进训练集（ch01 实测让 MAE 虚降 1.12）
+idx = np.random.permutation(len(df))
+train, test = df.iloc[idx[:int(0.8 * n)]], df.iloc[idx[int(0.8 * n):]]
+
+# ✅ 训练集**内部**打乱：只影响梯度下降看到样本的先后
+DataLoader(ds_train, batch_size=256, shuffle=True)
+```
+
+**为什么训练集内 shuffle 反而应该开**：
+
+1. **滑窗样本是强重叠的**。stride=1 时，相邻两个样本共享 95 个点。
+   不打乱 → 一个 batch 里全是几乎相同的样本 → 梯度方差极大、收敛慢。
+2. **不打乱会引入顺序偏差**。优化器按时间顺序走，会让参数在"年初 → 年末"的方向上漂移。
+3. **验证集 / 测试集必须 `shuffle=False`**。它们的指标是逐样本平均的，
+   顺序不影响结果；但关掉 shuffle 才能保证每次评估得到**完全一样**的数字（可复现）。
+
+**实测**（本章代码）：
+
+```
+shuffle=False 的第一个 batch 下标: [0, 1, 2, 3, 4, 5, 6, 7]
+shuffle=True  的第一个 batch 下标: [6, 15, 11, 13, 9, 2, 1, 17]      ← 打乱了
+```
+
+而且它在固定种子下**可复现** —— 这一点很重要，否则每次跑 notebook 指标都会飘。
+
+**判定规则**：
+
+> | 环节 | 能不能 shuffle |
+> |---|---|
+> | **切分**（train / valid / test 怎么分） | **绝对不能**。时序只能按时间切 |
+> | **训练集内的 batch 顺序** | **应该开**。重叠样本需要打散 |
+> | **验证 / 测试集的评估顺序** | 关掉。指标与顺序无关，关掉才可复现 |
+>
+> 一句话：**"能不能打乱"问的是「打乱的对象是划分还是顺序」**。
+"""
+    ),
+    code(T5_CODE),
+    md(
+        """
+## 6.3 防泄漏的缩放：手写 `fit` / `apply`
+
+神经网络对**输入尺度**很敏感：光伏 0 ~ 1063 kW 与负荷 275 ~ 740 kW 混在一层里，
+梯度方向会被大尺度特征主导。所以缩放是必需的 —— 但缩放器**必须是"无泄漏"的**。
+
+| 缩放方式 | 公式 | 参数 | 特点 |
+|---|---|---|---|
+| **z-score** | `(x − μ) / σ` | `μ, σ` | 对**分布**敏感；`np.std` 默认 `ddof=0`，与 sklearn 一致 |
+| **min-max** | `(x − min) / (max − min)` | `min, max` | 对**极值**敏感；一个离群点就能把整列压扁 |
+
+手写的价值在于**拆分 `fit` 与 `apply`**：
+
+```python
+mu, sd = fit_zscore(X_train)          # 只吃训练段
+X_train_s = apply_zscore(X_train, mu, sd)
+X_test_s  = apply_zscore(X_test,  mu, sd)   # ⚠️ 用同一组 (mu, sd)，不是自己再 fit 一次
+```
+
+三个台区的尺度差多少（实测）：
+
+| 序列 | 均值 | 标准差 |
+|---|---|---|
+| A（居民型负荷） | 460.2019 | 72.1892 |
+| B（工业型负荷） | 473.8505 | **281.1352**（A 的 **3.89 倍**） |
+| 光伏实际功率 | 210.5 | 293.2 |
+
+均值差不多，**标准差差 3.89 倍** —— 如果两条序列进同一个模型而不做**按序列**的缩放，
+模型会把 B 的波动当成"主要矛盾"，A 的日周期直接被淹没。
+
+### 6.3.1 难点深挖：全量拟合缩放器，在本数据上「测不出来」（负结果）
+
+**为什么难**：这是一个**教科书反复强调、但实测可能完全没有效果**的坑。
+写不出"果然变差了"的效果时，很多人会去编一个数字 —— **那是错的**。
+正确做法是：如实呈现负结果，并把**为什么会失灵**写清楚。
+
+**错误示范 / 正误对照**：
+
+```python
+mu_tr, sd_tr = fit_zscore(Xa_tr)        # ① 只用训练段拟合
+mu_all, sd_all = fit_zscore(Xa_all)     # ② 用全量（含测试段）拟合  ← 泄漏
+```
+
+**实测结果**（A 台区，72 → 24 的多输出 `Ridge`，测试段 MAE，kW）：
+
+| 缩放方式 | 训练段拟合 | 全量拟合 | 差 |
+|---|---|---|---|
+| **z-score** | 17.480038 | 17.480042 | **+0.00000381** |
+| **min-max** | 17.464098 | 17.464098 | **+0.00000000（一分不差）** |
+
+**min-max 为什么是"一分不差"**：看参数本身 ——
+
+```
+训练段 min/max  275.3900 / 739.9100
+全量   min/max  275.3900 / 739.9100      ← 完全一样
+```
+
+A 台区全年的最小值 275.39、最大值 739.91 **本来就落在前 80% 的时间里**。
+既然参数没变，`apply` 出来的结果自然一模一样，MAE 连第 7 位小数都不动。
+
+**z-score 为什么只有 3.8e-6**：窗口特征矩阵的均值从 454.520355 变成 459.835022
+（差 **1.17%**），标准差从 72.797569 变成 72.121338（差 **0.93%**）。
+这个差别太小了，原因是三条：
+
+1. **只有单台区**：A 是一条平稳的合成序列，没有"装机扩容 / 负荷年增长"这种强漂移
+   （数据集里其实埋了年增长因子，但幅度很小 —— 测试段均值 482.76 只比训练段高 **6.20%**）
+2. **特征尺度接近**：训练的 72 个特征（同一列错位的窗口）量纲完全一致
+3. **`Ridge` 对特征的线性缩放不敏感**：等比例放缩后，正则项的相对强度几乎不变
+
+**判定规则**：
+
+> **无论测出来的差别多小，缩放参数只能来自训练段 —— 因为它零成本。**
+>
+> | 情况 | 全量拟合的后果 |
+> |---|---|
+> | 分布平稳 + 线性模型（**本章**） | 测不出来（1e-5）→ **负结果，如实写** |
+> | 分布漂移明显（装机扩容、负荷年增长） | 明显虚高 |
+> | 对尺度敏感的模型（KNN / SVM / 神经网络） | 明显虚高 |
+> | 用 **min-max**，且极值恰好落在训练段 | **零影响**（参数根本没变） |
+>
+> 这一条与 ch01 §1.4.1 的第三种泄漏是同源结论：
+> **泄漏的严重程度取决于「泄漏信息有多大」和「模型有多敏感」，不是"教科书说了就会变差"。**
+"""
+    ),
+    code(T6_CODE),
+    code(T7_CODE),
+    code(T8_CODE),
+    md(
+        """
+## 6.4 `TimeSeriesSplit`：手写 + 与 sklearn 对账
+
+**永远不要用 `train_test_split` 做时序**。正规做法是滚动切分（rolling-origin CV）。
+`sklearn.model_selection.TimeSeriesSplit` 的规则很简单：
+
+```
+n = 8760, n_splits = 4  →  fold = n // (n_splits + 1) = 1752
+第 1 折   训练 [0, 1752)            验证 [1752, 3504)
+第 2 折   训练 [0, 3504)            验证 [3504, 5256)
+第 3 折   训练 [0, 5256)            验证 [5256, 7008)
+第 4 折   训练 [0, 7008)            验证 [7008, 8760)   ← 最后一折吃到末尾
+```
+
+三条必须记住的：
+
+1. **验证段的位置固定**（`k * fold`），**训练段从 0 开始铺**。
+   所以每一折的训练段都是**扩展窗**（expanding window），数据越攒越多。
+2. **最后一折的验证段要吃到序列末尾**，把 `n % (n_splits + 1)` 的余数一起吃掉。
+   8760 / 5 正好整除，所以本章每折都是 1752。
+3. **手写一遍再跟库对账**：手写让你知道每个下标从哪来；对账保证你没写错。
+   本章在 `gap ∈ {0, 24, 48}` 三种配置下逐折比对 `train_idx` 与 `valid_idx`，**全部一致**。
+
+### 6.4.1 难点深挖：`gap` 到底削掉了什么
+
+**为什么难**：`gap` 的官方描述是"从每个训练集末尾排除掉的样本数"，
+一句话读完很容易理解成"验证段往后挪" —— **完全不是**。实测：
+
+```
+gap=0  折边界 (train_end, valid_lo, valid_hi):
+       [(1752, 1752, 3504), (3504, 3504, 5256), (5256, 5256, 7008), (7008, 7008, 8760)]
+gap=24 折边界 (train_end, valid_lo, valid_hi):
+       [(1728, 1752, 3504), (3480, 3504, 5256), (5232, 5256, 7008), (6984, 7008, 8760)]
+```
+
+**验证段的起点和终点一个都没动**（1752 / 3504 / 5256 / 7008）。
+变的只有**训练段的末端**：1752 → 1728、3504 → 3480 …… 每折都**往后退 24 个点**。
+这 24 个点就是被 `gap` 削掉的「缓冲区」。
+
+**为什么需要这 24 个点**：因为我们的样本是**滑窗**的。
+
+```
+样本 i 的输入 = [i, i+72)，目标 = [i+72, i+96)
+```
+
+只要 `i` 落在验证段起点**前 96 个位置**内，这个样本的**目标就伸进了验证段**。
+把它放进训练集 = 模型见过验证期的真值。`gap=96` 才能彻底隔开；
+`gap=24` 隔开的是"最近 24 小时"（一个 horizon 的长度）。
+
+> **本章的 `WINDOW + HORIZON = 96`，所以严格的做法是 `gap=96`。**
+> 这里演示 `gap=24` 是为了和 sklearn 的默认语义对齐、把机制讲清楚。
+> ch05 §5.1 用的是**更彻底**的做法：直接按「训练窗口的目标必须整体落在切分点之前」
+> 过滤，等价于 `gap = WINDOW + HORIZON = 96`。
+
+**判定规则**：
+
+> **`gap` 的最小合法值 = `WINDOW + HORIZON - 1`。**
+> - 样本跨度 = `WINDOW + HORIZON`，所以起点至少要离验证段 `WINDOW + HORIZON - 1` 远
+> - `gap` 太小 → 训练样本的目标伸进验证段 → 指标虚高
+> - 手写一个 `ts_split` 并且**把每折的 `(train_end, valid_lo, valid_hi)` 打印出来**，
+>   是检查 `gap` 有没有生效最快的办法
+"""
+    ),
+    code(T9_CODE),
+    code(T10_CODE),
+    md(
+        """
+## 6.5 滑窗 vs 扩展窗
+
+`TimeSeriesSplit` 天生给的是**扩展窗**（expanding window）：第 k 折的训练段是 `[0, k*fold)`。
+另一种做法是**滑窗**（sliding window）：训练段长度恒定，只往前平移。
+
+```
+扩展窗  第 1 折  [0, 1752)                     样本 1657
+        第 2 折  [0, 3504)                     样本 3409
+        第 3 折  [0, 5256)                     样本 5161
+        第 4 折  [0, 7008)                     样本 6913
+
+滑窗    第 1 折  [0, 1752)                     样本 1657
+        第 2 折  [1752, 3504)                  样本 1657
+        第 3 折  [3504, 5256)                  样本 1657
+        第 4 折  [5256, 7008)                  样本 1657
+```
+
+**实测 4 折 MAE（kW，A 台区，多输出 `Ridge`）**：
+
+| 折 | 1 | 2 | 3 | 4 | 折均 |
+|---|---|---|---|---|---|
+| **扩展窗** | 19.718073 | 17.931772 | 16.926867 | 17.480038 | **18.014187** |
+| **滑窗** | 19.718073 | 19.012787 | **17.426353** | 18.866442 | **18.755914** |
+
+第 1 折两条线必然重合（数据量都是 1657）。从第 2 折起扩展窗（数据更多）稳定更好，
+折均领先 **0.741726 kW**。有趣的是**滑窗在第 3 折反而赢了**
+（17.426353 vs 16.926867 的另一侧 —— 扩展窗仍然更好，只是差距最小），
+原因是第 3 折的时间段里，最老的那一年数据已经"过期"了，扩展窗多喂的那部分帮助有限。
+
+### 6.5.1 难点深挖：扩展窗与滑窗怎么选
+
+**为什么难**：两者的代码只差**一个下标的写法**（`lo_i = 0` vs `lo_i = tr_end - LEN`），
+但在数据量、概念漂移、可复现性上是三件不同的事。
+
+| 维度 | 扩展窗 | 滑窗 |
+|---|---|---|
+| 训练样本数 | **递增**（1657 → 6913） | 恒定（1657） |
+| 各折指标可比性 | **不可比**（数据量和时间段都变了） | **可比**（只有时间段在变） |
+| 对概念漂移 | 弱（老数据一直留着） | **强**（只保留最近一段） |
+| 训练时间 | 越到后面越慢 | 恒定 |
+| 能否做"生产环境模拟" | 不能（生产上不会越训越多） | **能**（固定窗口滚动上线） |
+
+**判定规则**：
+
+> **按"数据里有没有漂移"和"你要回答什么问题"来选：**
+> - 数据平稳、想榨干每一点信息 → **扩展窗**（本章的默认；实测折均好 0.74 kW）
+> - 有明确概念漂移（设备老化、政策变化、装机扩容）→ **滑窗**
+> - 要做**上线模拟** → **滑窗**（生产上不可能拿三年前的模型一直喂）
+> - 要**横向比不同折的指标**（比如画误差随折的变化）→ **滑窗**
+>   （扩展窗的折间差异混着"数据量"因素，解释不清）
+>
+> 还有一条工程纪律：**折的划分必须早于任何 `fit`**。
+> 本章的所有 `make_xy` / `fit_zscore` 都只在 `tr` 上做 —— 一旦 `fit` 用到 `va`，
+> §6.3 的负结果就会变成正结果（而且你不会发现）。
+"""
+    ),
+    code(T11_CODE),
+    code(T12_CODE),
+    md(
+        """
+## 6.6 本章小结
+
+### 三条「必须背下来」的纪律
+
+| 场景 | 规则 |
+|---|---|
+| 多实体切窗 | **必须先按实体分组**。判断方法：数分组前后样本数；差了多少就有多少跨界样本（本章 95 个） |
+| 能不能 shuffle | **切分绝对不能打乱；训练集内的 batch 顺序应该打乱** |
+| 缩放参数从哪来 | **只能从训练段 `fit`**。哪怕实测只差 1e-5（负结果），也照做 —— 它零成本 |
+
+### 数据构造的四步流水线
+
+```
+① 分组清洗   按实体取序列 → clean_series（按小时分组中位数 × 3 判异常 → 插值）
+② 切窗       WindowDataset([S_A, S_B, ...], window, horizon, stride)   ← 列表里一条一个实体
+③ 切分       TimeSeriesSplit，gap ≥ window + horizon - 1
+④ 缩放       在**每一折内部** fit 缩放器，且只在训练段 fit
+```
+
+### `TimeSeriesSplit` 速查
+
+```
+n = 8760, n_splits = 4  →  fold = 8760 // 5 = 1752
+  第 k 折：训练 = [0, k*fold - gap)     验证 = [k*fold, k*fold + fold)
+  最后一折的验证段 = [k*fold, n)        ← 余数一起吃掉
+```
+
+### 本章的负结果
+
+| 对比 | 实测差 | 结论 |
+|---|---|---|
+| z-score：全量 vs 训练段 | **+3.81e-6** | 测不出来 |
+| min-max：全量 vs 训练段 | **0.0（一分不差）** | 参数根本没变（极值落在训练段） |
+| 跨界样本：干净模型上的 MAE vs 测试段 | **165.19 vs 63.17（2.6 倍）** | 机制是真的 |
+| 混入 95 个跨界样本对整体指标 | **+0.033649** | 占比只有 0.55%，几乎测不出来 |
+
+> **负结果不是"可以不管"，而是"要知道它为什么现在不显形、什么时候会显形"。**
+> 缩放泄漏在（分布平稳 + 线性模型 + 极值在训练段）三个条件同时成立时才会失灵；
+> 跨界样本泄漏在（实体少 + 单次评估）时不显形，实体一多就会线性放大。
+
+## 易错点清单
+
+1. **`np.concatenate` 把多台区接起来再切窗 = 制造 95 个假样本**（本章实测）。
+2. **跨界样本的目标里会出现全年最大单步跳变**（349.35 kW，超过 A 的 142.34、B 的 303.38）。
+3. **判断有没有跨界，数样本数**：17425 vs 17330，差 95。
+4. **`Dataset.__getitem__` 只取一个样本**，不要在里面做 batch 逻辑。
+5. **`Dataset` 的索引要能"回指"**（`(第几条序列, 起点)`），否则边界查不出来。
+6. **`drop_last=True` 只给训练集**；验证集用了会漏掉尾巴上的样本。
+7. **`shuffle` 打乱的是顺序，不是划分**。切分绝不能 shuffle。
+8. **验证 / 测试集的评估顺序要关掉 shuffle**，否则指标每次跑都可能不一样。
+9. **手写 `fit` / `apply` 要分开**：`fit` 只吃训练段，`apply` 用同一组参数处理所有段。
+10. **`np.std` 默认 `ddof=0`**，与 sklearn `StandardScaler` 一致；用 `ddof=1` 就对不上了。
+11. **min-max 对极值敏感**：一个离群点就能把整列压扁到 0 附近。
+12. **`gap` 不是"验证段往后挪"**，而是**训练段末端往后退**（实测验证段起点一个都没变）。
+13. **`gap` 最小合法值 = `WINDOW + HORIZON - 1`**（本章 96 - 1 = 95）。
+14. **手写 `TimeSeriesSplit` 别忘了"最后一折吃掉余数"**，否则和 sklearn 对不上。
+15. **扩展窗与滑窗的折指标不可混着比**：扩展窗的差异里混着"数据量"因素。
+16. **所有 `fit` 都必须发生在"折划分之后"**，且只在训练段上。
+17. **多输出 MAE 要先 `.ravel()` 摊平**，否则 `mean_absolute_error` 会报形状错。
+18. **负结果要如实写**：缩放泄漏在本数据上只有 3.8e-6，写"果然变差 10%"就是编数据。
+"""
+    ),
+]
+
+# =========================================================================== #
+# 4. 练习 / 答案版（EXERCISE）                                                #
+# =========================================================================== #
+
+EXERCISE = [
+    md(
+        """
+# ch06 数据构造与标准化（练习版）
+
+> 补全所有 `____`，让每个代码块末尾的 `assert` 全绿。
+> 数据：`data/load_curve.csv`（A 居民型 / B 工业型）+ `data/pv_power.csv`（3 特征）。
+> `window=72` / `horizon=24`，与 ch05 对齐。
+
+## 任务清单
+
+| 任务 | 主题 | 挖空 | 对应讲解小节 |
+|---|---|---|---|
+| 1 | 分组清洗 + 多特征矩阵 | 3 | §6.1 |
+| 2 | 手写 `WindowDataset` | 3 | §6.1 |
+| 3 | 跨界窗口 vs 分组切窗 | 2 | §6.1.1 |
+| 4 | 跨界污染的量化证据 | 3 | §6.1.1 |
+| 5 | `DataLoader` 形状 + `shuffle` 边界 | 4 | §6.2.1 |
+| 6 | 手写 `fit` / `apply`（z-score + min-max） | 4 | §6.3 |
+| 7 | z-score 防泄漏：训练段 vs 全量 | 2 | §6.3.1 |
+| 8 | min-max 防泄漏：训练段 vs 全量 | 2 | §6.3.1 |
+| 9 | 手写 `TimeSeriesSplit` | 1 | §6.4 |
+| 10 | 与 sklearn 对账 + `gap` 语义 | 2 | §6.4.1 |
+| 11 | 滑窗 vs 扩展窗 | 1 | §6.5.1 |
+| 12 | 两张图：折切分示意 + 折 MAE 对照 | 1 | §6.5 |
+
+**合计 28 个挖空。**
+
+> ⚠️ 第 6 题里手写的 4 个函数**在练习版里函数体会变成 `____`**，
+> 所以它们在被调用时会报错 —— 这没关系：练习版在**第一个** `____` 处就停了。
+> 你要做的是照着提示把它们补全，然后对照第 7、8 题的 `assert`。
+"""
+    ),
+    code(IMPORTS),
+    code(SETUP),
+    code(PLOT_SETUP),
+    code(SCAFFOLD),
+    md("## 任务 1：按实体清洗 + 拼出多特征矩阵（§6.1）"),
+    code(T1_CODE),
+    md("## 任务 2：手写 `WindowDataset`（`window` / `horizon` / `stride` + 多特征）（§6.1）"),
+    code(T2_CODE),
+    md("## 任务 3：跨界切窗 vs 分组切窗 —— 数出 95 个假样本（§6.1.1）"),
+    code(T3_CODE),
+    md("## 任务 4：跨界污染有多严重 —— 干净模型在假样本上差 2.6 倍（§6.1.1）"),
+    code(T4_CODE),
+    md("## 任务 5：`DataLoader` 的形状与 `shuffle` 的合法边界（§6.2.1）"),
+    code(T5_CODE),
+    md("## 任务 6：手写 z-score / min-max 的 `fit` 与 `apply`（§6.3）"),
+    code(T6_CODE),
+    md("## 任务 7：z-score —— 全量拟合比训练段拟合好多少？（§6.3.1）"),
+    code(T7_CODE),
+    md("## 任务 8：min-max —— 负结果最彻底的那一个（§6.3.1）"),
+    code(T8_CODE),
+    md("## 任务 9：手写 `TimeSeriesSplit`（§6.4）"),
+    code(T9_CODE),
+    md("## 任务 10：与 sklearn 逐折对账 + 看清 `gap` 削掉了什么（§6.4.1）"),
+    code(T10_CODE),
+    md("## 任务 11：滑窗 vs 扩展窗，4 折实测（§6.5.1）"),
+    code(T11_CODE),
+    md("## 任务 12：两张图（折切分示意 + 折 MAE 对照）（§6.5）"),
+    code(T12_CODE),
+    md(
+        """
+## 自查清单（能不看笔记答出来才算过）
+
+- [ ] 12 个代码块的 assert 全部通过
+- [ ] 把 A / B 直接 `np.concatenate` 再切窗，会多出多少个样本？为什么？
+- [ ] 「输入窗口跨边界」和「目标跨边界」各有多少个？
+- [ ] 干净模型在跨界样本上的 MAE 是测试段的几倍？
+- [ ] 跨界样本的目标里最大的单步跳变是多少？比真实数据大多少？
+- [ ] `shuffle=True` 在时序上什么时候可以开、什么时候绝对不能开？
+- [ ] `drop_last=True` 该给训练集还是验证集？
+- [ ] `WindowDataset` 的索引表为什么存 `(第几条序列, 起点)` 而不是只存起点？
+- [ ] z-score 与 min-max 的公式分别是什么？哪个对极值敏感？
+- [ ] 全量拟合 vs 训练段拟合，z-score 差多少？min-max 差多少？为什么 min-max 是 0？
+- [ ] `gap` 参数改变的是训练段还是验证段？本章最小的合法 `gap` 是多少？
+- [ ] 滑窗与扩展窗，第几折开始出现差异？折均差多少？
+
+## 关键真值对照（做完再对）
+
+| 量 | 值 |
+|---|---|
+| A / B / PV 形状 | (8760,) / (8760,) / **(8760, 3)** |
+| A / B 标准差比 | **3.8943** |
+| 光伏实际功率清洗后 min | **0.0**（负值被 clip） |
+| 分组切窗样本数 | **17330**（8665 × 2） |
+| concat 切窗样本数 | **17425** |
+| **跨界样本数** | **95**（输入跨界 71 / 目标跨界 24） |
+| `stride=4` 的样本数 | 4334（每条 2167） |
+| `DataLoader(batch=8, drop_last=True)` | **1083** 个 batch，形状 (8, 72, 3) / (8, 24) |
+| B 测试段 MAE（干净训练） | **63.174770** |
+| 干净模型在 95 个跨界样本上的 MAE | **165.186264**（**2.6 倍**） |
+| 混入 95 个跨界样本后的 B 测试段 MAE | 63.208420（**+0.033649**） |
+| 跨界样本目标内最大单步跳变 | **349.35 kW**（A 142.34 / B 303.38） |
+| z-score：训练段 / 全量 | **17.480038 / 17.480042**（差 **+3.81e-6**） |
+| min-max：训练段 / 全量 | 17.464098 / 17.464098（差 **0**） |
+| z-score 参数：训练段 → 全量 | 均值 454.520355 → 459.835022（+1.17%）；std 72.797569 → 72.121338 |
+| A 训练段 min/max vs 全量 | 275.3900/739.9100 **完全相同** |
+| `ts_split(8760, 4, 0)` 折边界 | (1752,1752,3504) (3504,3504,5256) (5256,5256,7008) (7008,7008,8760) |
+| `gap=24` 第 1 折 | train_end **1728** / valid [1752, 3504) |
+| 手写 vs sklearn（gap=0/24/48） | **全部一致** |
+| 扩展窗 4 折 MAE | 19.718073 / 17.931772 / 16.926867 / 17.480038，折均 **18.014187** |
+| 滑窗 4 折 MAE | 19.718073 / 19.012787 / 17.426353 / 18.866442，折均 **18.755914** |
+
+> **三条纪律**：切窗先分组；切分不打乱、训练集内打乱；缩放只在训练段 `fit`。
+"""
+    ),
+]
+
+if __name__ == "__main__":
+    report([build(OUT, NAME, lesson=LESSON, exercise=EXERCISE)])
